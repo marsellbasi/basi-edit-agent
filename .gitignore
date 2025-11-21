@@ -1,0 +1,32 @@
+# BASI Edit Agent - ignore big stuff & junk
+
+# Datasets / archives / previews
+BASI_ARCHIVE/
+*.zip
+*.tar
+*.tar.gz
+
+# Model checkpoints
+*.pt
+*.pth
+checkpoints/
+runs/
+
+# Python cache / venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

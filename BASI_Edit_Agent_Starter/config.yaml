@@ -1,0 +1,4 @@
+dataset_root: ./BASI_EDIT_AGENT
+output_root: ./BASI_EDIT_AGENT
+random_seed: 42
+

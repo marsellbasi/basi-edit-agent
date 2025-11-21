@@ -1,0 +1,14 @@
+name: basi-edit-agent
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - numpy
+      - pyyaml
+      - pillow
+      - opencv-python
+      - torch
+      - torchvision
+      - tqdm
