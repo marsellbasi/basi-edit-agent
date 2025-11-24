@@ -211,39 +211,43 @@ def train(args):
 
     # Create model
 
+    def _center_crop(img: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+        """
+        img: (C, H, W)
+        Returns a center-cropped tensor of shape (C, target_h, target_w).
+        """
+        _, h, w = img.shape
+        top = max(0, (h - target_h) // 2)
+        left = max(0, (w - target_w) // 2)
+        return img[:, top:top + target_h, left:left + target_w]
+
     # custom collate: stack befores and afters into tensors
     def collate_fn(batch):
         """
         batch: list of (before_tensor, after_tensor)
-        Returns:
+        returns:
           xb: (B, 3, H, W)
           yb: (B, 3, H, W)
-
-        We handle small spatial mismatches (e.g. 640x426 vs 640x427)
-        by center-cropping every tensor in the batch down to the
-        minimal height and width observed over the batch.
+        We center-crop all images in the batch to the same (min_h, min_w)
+        so torch.stack() will not fail on tiny mismatches like 426 vs 427.
         """
         befores, afters = zip(*batch)  # unzip
 
-        # Ensure contiguous tensors
-        befores = [b.contiguous() for b in befores]
-        afters = [a.contiguous() for a in afters]
+        # Compute global minimum H and W across both before and after tensors
+        all_h = [b.shape[1] for b in befores] + [a.shape[1] for a in afters]
+        all_w = [b.shape[2] for b in befores] + [a.shape[2] for a in afters]
+        target_h = min(all_h)
+        target_w = min(all_w)
 
-        # Compute minimal H, W across before+after tensors
-        min_h = min(t.shape[1] for t in (*befores, *afters))
-        min_w = min(t.shape[2] for t in (*befores, *afters))
+        cropped_befores = [
+            _center_crop(b.contiguous(), target_h, target_w) for b in befores
+        ]
+        cropped_afters = [
+            _center_crop(a.contiguous(), target_h, target_w) for a in afters
+        ]
 
-        def center_crop(t: torch.Tensor) -> torch.Tensor:
-            _, h, w = t.shape
-            top = max((h - min_h) // 2, 0)
-            left = max((w - min_w) // 2, 0)
-            return t[:, top:top + min_h, left:left + min_w]
-
-        befores = [center_crop(b) for b in befores]
-        afters = [center_crop(a) for a in afters]
-
-        xb = torch.stack(befores, dim=0)
-        yb = torch.stack(afters, dim=0)
+        xb = torch.stack(cropped_befores, dim=0)
+        yb = torch.stack(cropped_afters, dim=0)
         return xb, yb
 
     # ----- dataloaders -----
@@ -282,7 +286,7 @@ def train(args):
             xb = xb.to(device)
             yb = yb.to(device)
 
-            opt.zero_grad()
+            optimizer.zero_grad()
 
             residual = model(xb)
             # scale residual to be reasonably small at the start
@@ -291,7 +295,7 @@ def train(args):
 
             loss = F.l1_loss(y_hat, yb)
             loss.backward()
-            opt.step()
+            optimizer.step()
 
             running += loss.item() * xb.size(0)
             pbar.set_postfix({"L1": f"{loss.item():.4f}"})
