@@ -276,6 +276,7 @@ def train(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    best_val = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -322,8 +323,18 @@ def train(args):
 
         if val_l1 < best_val:
             best_val = val_l1
-            torch.save(model.state_dict(), best_path)
-            print(f"👍 New best checkpoint saved to {best_path} (val L1 {best_val:.4f})")
+            os.makedirs(args.model_dir, exist_ok=True)
+            ckpt_path = os.path.join(args.model_dir, "bg_residual_best.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_l1": val_l1,
+                },
+                ckpt_path,
+            )
+            print(f"✅ New best val L1={val_l1:.4f} — checkpoint saved to {ckpt_path}")
 
 
 def parse_args():
