@@ -186,6 +186,60 @@ def collate_pairs(batch):
 
 
 # -----------------------------
+# Preview generation
+# -----------------------------
+def generate_previews(model, val_ds, device, output_dir, max_samples=6):
+    """Generate triplet previews for first N validation pairs."""
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+    
+    count = 0
+    with torch.no_grad():
+        for i in range(min(max_samples, len(val_ds))):
+            xb, yb = val_ds[i]
+            xb = xb.unsqueeze(0).to(device)  # (1, 3, H, W)
+            yb = yb.unsqueeze(0).to(device)
+            
+            residual = model(xb)
+            residual = torch.tanh(residual) * 0.3
+            y_hat = torch.clamp(xb + residual, 0.0, 1.0)
+            
+            # Convert to PIL
+            before_img = TF.to_pil_image(xb[0].cpu())
+            model_img = TF.to_pil_image(y_hat[0].cpu())
+            after_img = TF.to_pil_image(yb[0].cpu())
+            
+            # Resize to same height
+            target_h = max(before_img.height, model_img.height, after_img.height)
+            if before_img.height != target_h:
+                w = int(before_img.width * target_h / before_img.height)
+                before_img = before_img.resize((w, target_h), Image.LANCZOS)
+            if model_img.height != target_h:
+                w = int(model_img.width * target_h / model_img.height)
+                model_img = model_img.resize((w, target_h), Image.LANCZOS)
+            if after_img.height != target_h:
+                w = int(after_img.width * target_h / after_img.height)
+                after_img = after_img.resize((w, target_h), Image.LANCZOS)
+            
+            # Create triplet
+            total_w = before_img.width + model_img.width + after_img.width
+            triplet = Image.new("RGB", (total_w, target_h))
+            x = 0
+            triplet.paste(before_img, (x, 0))
+            x += before_img.width
+            triplet.paste(model_img, (x, 0))
+            x += model_img.width
+            triplet.paste(after_img, (x, 0))
+            
+            # Save
+            out_path = os.path.join(output_dir, f"{i:03d}_triplet.jpg")
+            triplet.save(out_path, quality=95)
+            count += 1
+    
+    return count
+
+
+# -----------------------------
 # Training loop
 # -----------------------------
 def train(args):
@@ -277,8 +331,31 @@ def train(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     best_val = float("inf")
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # Handle resume logic
+    if args.resume:
+        if args.resume_ckpt:
+            ckpt_path = args.resume_ckpt
+        else:
+            # Auto-resume from bg_residual_last.pt in model_dir
+            ckpt_path = os.path.join(args.model_dir, "bg_residual_last.pt")
+        
+        if os.path.exists(ckpt_path):
+            print(f"Loading checkpoint from {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt.get("epoch", 1) + 1
+            best_val = ckpt.get("best_val", ckpt.get("val_l1", float("inf")))
+            print(f"Resuming from epoch {start_epoch}, best_val={best_val:.4f}")
+        else:
+            if args.resume_ckpt:
+                print(f"Warning: checkpoint {ckpt_path} not found, starting fresh")
+            else:
+                print(f"Warning: auto-resume checkpoint {ckpt_path} not found, starting fresh")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running = 0.0
 
@@ -321,9 +398,28 @@ def train(args):
         val_l1 = val_running / len(val_ds)
         print(f"Epoch {epoch} done | Train L1: {train_l1:.4f} | Val L1: {val_l1:.4f}")
 
+        # Generate previews if enabled
+        if args.preview_every > 0 and epoch % args.preview_every == 0:
+            preview_dir = os.path.join(args.model_dir, "previews", f"epoch_{epoch:03d}")
+            count = generate_previews(model, val_ds, device, preview_dir, max_samples=6)
+            print(f"  Saved {count} preview triplets to {preview_dir}")
+
+        # Save last checkpoint
+        os.makedirs(args.model_dir, exist_ok=True)
+        last_ckpt_path = os.path.join(args.model_dir, "bg_residual_last.pt")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_l1": val_l1,
+                "best_val": best_val,
+            },
+            last_ckpt_path,
+        )
+
         if val_l1 < best_val:
             best_val = val_l1
-            os.makedirs(args.model_dir, exist_ok=True)
             ckpt_path = os.path.join(args.model_dir, "bg_residual_best.pt")
             torch.save(
                 {
@@ -331,6 +427,7 @@ def train(args):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_l1": val_l1,
+                    "best_val": best_val,
                 },
                 ckpt_path,
             )
@@ -355,6 +452,13 @@ def parse_args():
                    default="BASI_EDIT_AGENT/bg_v1/val/before/*.jpg")
     p.add_argument("--val_after_glob", type=str,
                    default="BASI_EDIT_AGENT/bg_v1/val/after/*.jpg")
+
+    p.add_argument("--resume", action="store_true",
+                   help="Resume training from checkpoint")
+    p.add_argument("--resume_ckpt", type=str, default=None,
+                   help="Path to checkpoint file. If --resume is set but no path given, auto-resumes from bg_residual_last.pt in model_dir")
+    p.add_argument("--preview_every", type=int, default=0,
+                   help="Generate preview triplets every N epochs (0 to disable)")
 
     return p.parse_args()
 
