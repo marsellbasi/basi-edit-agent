@@ -7,7 +7,7 @@ import torch
 from PIL import Image
 from torchvision import transforms as T
 
-from BASI_Edit_Agent_Starter.train_bg_model_residual import BgResidualNet
+from train_bg_model_residual import BgResidualNet
 
 
 def parse_args():
