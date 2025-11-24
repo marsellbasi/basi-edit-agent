@@ -127,6 +127,20 @@ class BgResidualNet(nn.Module):
 
         self.out_conv = nn.Conv2d(base_ch, in_ch, 1)
 
+    def _align_and_cat(self, up: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        """
+        Align the spatial size of `up` to match `skip` before concatenation.
+        This prevents off-by-one H/W mismatches coming from upsampling.
+        """
+        if up.shape[2:] != skip.shape[2:]:
+            up = F.interpolate(
+                up,
+                size=skip.shape[2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return torch.cat([up, skip], dim=1)
+
     def forward(self, x):
         # Encoder
         d1 = self.down1(x)
@@ -143,15 +157,15 @@ class BgResidualNet(nn.Module):
 
         # Decoder
         u3 = F.interpolate(b, scale_factor=2, mode="bilinear", align_corners=False)
-        u3 = torch.cat([u3, d3], dim=1)
+        u3 = self._align_and_cat(u3, d3)
         u3 = self.up3(u3)
 
         u2 = F.interpolate(u3, scale_factor=2, mode="bilinear", align_corners=False)
-        u2 = torch.cat([u2, d2], dim=1)
+        u2 = self._align_and_cat(u2, d2)
         u2 = self.up2(u2)
 
         u1 = F.interpolate(u2, scale_factor=2, mode="bilinear", align_corners=False)
-        u1 = torch.cat([u1, d1], dim=1)
+        u1 = self._align_and_cat(u1, d1)
         u1 = self.up1(u1)
 
         # Residual (unconstrained); we clamp after adding back to x
@@ -199,10 +213,38 @@ def train(args):
 
     # custom collate: stack befores and afters into tensors
     def collate_fn(batch):
-        befores, afters = zip(*batch)   # tuples of tensors
-        befores = torch.stack([b.contiguous() for b in befores], dim=0)
-        afters  = torch.stack([a.contiguous() for a in afters],  dim=0)
-        return befores, afters
+        """
+        batch: list of (before_tensor, after_tensor)
+        Returns:
+          xb: (B, 3, H, W)
+          yb: (B, 3, H, W)
+
+        We handle small spatial mismatches (e.g. 640x426 vs 640x427)
+        by center-cropping every tensor in the batch down to the
+        minimal height and width observed over the batch.
+        """
+        befores, afters = zip(*batch)  # unzip
+
+        # Ensure contiguous tensors
+        befores = [b.contiguous() for b in befores]
+        afters = [a.contiguous() for a in afters]
+
+        # Compute minimal H, W across before+after tensors
+        min_h = min(t.shape[1] for t in (*befores, *afters))
+        min_w = min(t.shape[2] for t in (*befores, *afters))
+
+        def center_crop(t: torch.Tensor) -> torch.Tensor:
+            _, h, w = t.shape
+            top = max((h - min_h) // 2, 0)
+            left = max((w - min_w) // 2, 0)
+            return t[:, top:top + min_h, left:left + min_w]
+
+        befores = [center_crop(b) for b in befores]
+        afters = [center_crop(a) for a in afters]
+
+        xb = torch.stack(befores, dim=0)
+        yb = torch.stack(afters, dim=0)
+        return xb, yb
 
     # ----- dataloaders -----
     train_loader = DataLoader(
