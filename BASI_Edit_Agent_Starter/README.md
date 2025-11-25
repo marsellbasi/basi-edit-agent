@@ -112,6 +112,26 @@ python make_triplet_previews.py \
   --residual_scale 0.3
 ```
 
+### Stage 2 wrapper script
+For a complete pipeline (train + backup + apply + triplets) in one go:
+```bash
+cd /workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter
+chmod +x train_stage2_bg_residual.sh
+bash train_stage2_bg_residual.sh 20
+```
+
+The script accepts positional arguments:
+- `$1`: epochs (default: 20)
+- `$2`: batch_size (default: 2)
+- `$3`: max_side (default: 640)
+- `$4`: identity_weight (default: 0.3)
+
+It will:
+1. Train BgResidualNet (auto-resumes if checkpoints exist)
+2. Backup checkpoints to GCS (if gsutil is available)
+3. Apply the model to validation "before" images
+4. Build before|pred|after triplet strips
+
 ---
 
 If you get stuck, open the CSV report and check unmatched rows.
