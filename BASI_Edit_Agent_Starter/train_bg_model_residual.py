@@ -2,7 +2,7 @@
 # with the version above, then:
 #   Ctrl+O, Enter to save
 #   Ctrl+X to exit
-import argparse, os, glob
+import argparse, os, glob, subprocess
 from PIL import Image
 
 import torch
@@ -183,6 +183,27 @@ def collate_pairs(batch):
     xb = torch.stack(befores, dim=0)
     yb = torch.stack(afters, dim=0)
     return xb, yb
+
+
+# -----------------------------
+# GCS Backup
+# -----------------------------
+def backup_to_gcs(model_dir, gcs_backup_dir):
+    """Copy model_dir to GCS using gsutil. Returns True on success, False on failure."""
+    if not gcs_backup_dir:
+        return False
+    
+    try:
+        cmd = ["gsutil", "-m", "cp", "-r", model_dir, gcs_backup_dir]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"✅ Successfully backed up {model_dir} to {gcs_backup_dir}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ GCS backup failed: {e.stderr.strip()}")
+        return False
+    except Exception as e:
+        print(f"❌ GCS backup error: {str(e)}")
+        return False
 
 
 # -----------------------------
@@ -432,6 +453,14 @@ def train(args):
                 ckpt_path,
             )
             print(f"✅ New best val L1={val_l1:.4f} — checkpoint saved to {ckpt_path}")
+            # Backup to GCS if enabled
+            if args.gcs_backup_dir:
+                backup_to_gcs(args.model_dir, args.gcs_backup_dir)
+
+    # Final backup after training completes
+    if args.gcs_backup_dir:
+        print(f"\nBacking up final model directory to GCS...")
+        backup_to_gcs(args.model_dir, args.gcs_backup_dir)
 
 
 def parse_args():
@@ -459,6 +488,8 @@ def parse_args():
                    help="Path to checkpoint file. If --resume is set but no path given, auto-resumes from bg_residual_last.pt in model_dir")
     p.add_argument("--preview_every", type=int, default=0,
                    help="Generate preview triplets every N epochs (0 to disable)")
+    p.add_argument("--gcs_backup_dir", type=str, default="",
+                   help="GCS path to backup model_dir (e.g., gs://bucket/path). Empty to disable.")
 
     return p.parse_args()
 

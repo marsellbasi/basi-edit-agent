@@ -18,6 +18,8 @@ def parse_args():
     parser.add_argument("--after_glob", required=True, type=str)
     parser.add_argument("--model_ckpt", required=True, type=str)
     parser.add_argument("--out_dir", required=True, type=str)
+    parser.add_argument("--save_residual_maps", action="store_true", default=False,
+                       help="Also save grayscale residual magnitude maps for debugging")
     return parser.parse_args()
 
 
@@ -75,15 +77,21 @@ def main():
             print(f"Skipping {name} due to error: {exc}")
             continue
 
+        # Use same transform as training: T.ToTensor() converts PIL to [0,1] tensor
         before_tensor = to_tensor(before_img).to(device)
         after_tensor = to_tensor(after_img).to(device)
-        xb = before_tensor.unsqueeze(0)
+        xb = before_tensor.unsqueeze(0)  # (1, 3, H, W)
 
         with torch.no_grad():
             residual = model(xb)
-            model_img_tensor = torch.clamp(xb + residual, 0.0, 1.0).squeeze(0).cpu()
+            # Apply same scaling as training: tanh * 0.3
+            residual = torch.tanh(residual) * 0.3
+            # Reconstruct prediction: inputs are [0,1], so just add and clamp
+            pred = torch.clamp(xb + residual, 0.0, 1.0).squeeze(0).cpu()
+            # Keep scaled residual for magnitude map if needed
+            residual_scaled = residual.squeeze(0).cpu()
 
-        model_pil = to_pil(model_img_tensor)
+        model_pil = to_pil(pred)
         before_pil = to_pil(before_tensor.cpu())
         after_pil = to_pil(after_tensor.cpu())
 
@@ -104,6 +112,17 @@ def main():
         out_path = os.path.join(args.out_dir, f"{stem}_triplet.jpg")
         triplet.save(out_path, quality=95)
         saved += 1
+
+        # Save residual magnitude map if requested
+        if args.save_residual_maps:
+            # Compute L2 norm across channels: (H, W)
+            residual_mag = torch.norm(residual_scaled, dim=0)
+            # Normalize to [0, 1] for visualization
+            residual_mag = residual_mag / (residual_mag.max() + 1e-8)
+            # Convert to PIL grayscale
+            residual_pil = Image.fromarray((residual_mag.numpy() * 255).astype('uint8'), mode='L')
+            residual_path = os.path.join(args.out_dir, f"{stem}_residual.jpg")
+            residual_pil.save(residual_path, quality=95)
 
     print(f"Saved {saved} triplet previews to {args.out_dir}")
 
