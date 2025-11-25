@@ -59,4 +59,59 @@ python watch_agent.py --config config.yaml --sleep 10
 Drop JPG/PNG/TIF images into `<output_root>/agent/inbox`; outputs land in `outbox/`. Done markers are written to `done/`.
 
 ---
+
+## RunPod Bootstrap (for Stage 2 Background Training)
+
+For training the background residual model on RunPod pods:
+
+### First-time pod setup
+```bash
+cd /workspace/code
+git clone https://github.com/marsellbasi/basi-edit-agent.git
+cd basi-edit-agent
+bash basi_pod_bootstrap_v2.sh
+```
+
+This script will:
+- Install Google Cloud SDK (gcloud + gsutil) if missing
+- Ensure gcloud/gsutil are on PATH for current and future shells
+- Activate service account and set project
+- Clone or update the basi-edit-agent repo
+- Sync Stage 2 bg_residual checkpoints from GCS
+- Install Python dependencies (tqdm, etc.)
+
+### New shell setup
+If you open a new shell and need gcloud/gsutil on PATH:
+```bash
+bash refresh_gcloud_env.sh
+```
+
+Or rely on `~/.bashrc` sourcing (automatically added by bootstrap).
+
+### Training Stage 2 background model
+```bash
+cd BASI_Edit_Agent_Starter
+python train_bg_model_residual.py \
+  --train_before_glob "BASI_EDIT_AGENT/bg_v1/train/before/*.jpg" \
+  --train_after_glob "BASI_EDIT_AGENT/bg_v1/train/after/*.jpg" \
+  --val_before_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --val_after_glob "BASI_EDIT_AGENT/bg_v1/val/after/*.jpg" \
+  --model_dir "checkpoints/bg_v1_residual_e10" \
+  --resume \
+  --epochs 20 \
+  --identity_weight 0.3
+```
+
+### Generating triplet previews
+```bash
+python make_triplet_previews.py \
+  --before_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --after_glob "BASI_EDIT_AGENT/bg_v1/val/after/*.jpg" \
+  --model_ckpt "checkpoints/bg_v1_residual_e10/bg_residual_best.pt" \
+  --out_dir "BASI_EDIT_AGENT/bg_v1/val/bg_v1_residual_e20_triplets" \
+  --residual_scale 0.3
+```
+
+---
+
 If you get stuck, open the CSV report and check unmatched rows.

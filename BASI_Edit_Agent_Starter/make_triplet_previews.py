@@ -21,8 +21,8 @@ def parse_args():
     parser.add_argument(
         "--residual_scale",
         type=float,
-        default=1.0,
-        help="Scale factor for residual before adding to input (e.g., 0.5 for milder effect)",
+        default=0.3,
+        help="Scale factor for residual after tanh (default 0.3, same as training)",
     )
     parser.add_argument("--save_residual_maps", action="store_true", default=False,
                        help="Also save grayscale residual magnitude maps for debugging")
@@ -89,11 +89,9 @@ def main():
         xb = before_tensor.unsqueeze(0)  # (1, 3, H, W)
 
         with torch.no_grad():
-            residual = model(xb)
-            # Apply same scaling as training: tanh * 0.3
-            residual = torch.tanh(residual) * 0.3
-            # Allow an additional user-controlled scale for previews
-            residual_scaled = args.residual_scale * residual
+            residual = model(xb)  # model predicts residual
+            # Apply same scaling as training: tanh * residual_scale (default 0.3)
+            residual_scaled = torch.tanh(residual) * args.residual_scale
             # Reconstruct prediction: inputs are [0,1], so just add and clamp
             pred = torch.clamp(xb + residual_scaled, 0.0, 1.0).squeeze(0).cpu()
             # Keep the scaled residual for magnitude map if needed
@@ -137,3 +135,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Example usage:
+# python BASI_Edit_Agent_Starter/make_triplet_previews.py \
+#   --before_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+#   --after_glob  "BASI_EDIT_AGENT/bg_v1/val/after/*.jpg" \
+#   --model_ckpt  "BASI_Edit_Agent_Starter/checkpoints/bg_v1_residual_e10/bg_residual_best.pt" \
+#   --out_dir  "BASI_EDIT_AGENT/bg_v1/val/bg_v1_residual_e20_triplets" \
+#   --residual_scale 0.3
