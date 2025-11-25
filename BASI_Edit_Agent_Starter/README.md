@@ -88,6 +88,55 @@ bash refresh_gcloud_env.sh
 
 Or rely on `~/.bashrc` sourcing (automatically added by bootstrap).
 
+---
+
+## Stage 1 – Global Color Model
+
+### Train Stage 1 color model
+```bash
+cd /workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter
+chmod +x train_stage1_color.sh
+./train_stage1_color.sh        # default 20 epochs
+# or:
+EPOCHS=10 ./train_stage1_color.sh
+# or:
+./train_stage1_color.sh 10
+```
+
+The script will automatically resume if it finds an existing checkpoint at `BASI_ARCHIVE/models/color_v0/color_model.json`.
+
+### Apply Stage 1 to a folder
+```bash
+python3 apply_color_model.py \
+  --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --output_dir "BASI_EDIT_AGENT/stage1_color_only/val_e20" \
+  --model_ckpt "checkpoints/color_v1_e20/color_model.json"
+```
+
+Or use the default checkpoint location:
+```bash
+python3 apply_color_model.py \
+  --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --output_dir "BASI_EDIT_AGENT/stage1_color_only/val_e20" \
+  --model_ckpt "BASI_ARCHIVE/models/color_v0/color_model.json"
+```
+
+### Combine with Stage 2 triplets
+After running Stage 1, you can create triplets showing the progression:
+```bash
+# Create triplets with Stage 1 outputs as "after" images
+python make_triplet_previews.py \
+  --before_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --after_glob "BASI_EDIT_AGENT/stage1_color_only/val_e20/*.jpg" \
+  --model_ckpt "checkpoints/bg_v1_residual_e10/bg_residual_best.pt" \
+  --out_dir "BASI_EDIT_AGENT/bg_v1/val/stage1_stage2_triplets" \
+  --residual_scale 0.3
+```
+
+---
+
+## Stage 2 – Background Residual Model
+
 ### Training Stage 2 background model
 ```bash
 cd BASI_Edit_Agent_Starter
