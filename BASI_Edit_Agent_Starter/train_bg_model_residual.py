@@ -7,6 +7,7 @@ from PIL import Image
 
 import torch
 from torch import nn
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 from torchvision import transforms as T
@@ -376,9 +377,13 @@ def train(args):
             else:
                 print(f"Warning: auto-resume checkpoint {ckpt_path} not found, starting fresh")
 
+    identity_weight = args.identity_weight
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        running = 0.0
+        running_total = 0.0
+        running_bg = 0.0
+        running_identity = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]")
         for xb, yb in pbar:
@@ -390,16 +395,26 @@ def train(args):
             residual = model(xb)
             # scale residual to be reasonably small at the start
             residual = torch.tanh(residual) * 0.3
-            y_hat = torch.clamp(xb + residual, 0.0, 1.0)
+            pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-            loss = F.l1_loss(y_hat, yb)
+            loss_bg = F.l1_loss(pred, yb)
+            loss_identity = F.l1_loss(pred, xb)
+            loss = loss_bg + identity_weight * loss_identity
             loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            running += loss.item() * xb.size(0)
-            pbar.set_postfix({"L1": f"{loss.item():.4f}"})
+            batch_size = xb.size(0)
+            running_total += loss.item() * batch_size
+            running_bg += loss_bg.item() * batch_size
+            running_identity += loss_identity.item() * batch_size
+            pbar.set_postfix(
+                {"bg": f"{loss_bg.item():.4f}", "id": f"{loss_identity.item():.4f}"}
+            )
 
-        train_l1 = running / len(train_ds)
+        train_total = running_total / len(train_ds)
+        train_bg = running_bg / len(train_ds)
+        train_id = running_identity / len(train_ds)
 
         # --- validation ---
         model.eval()
@@ -411,13 +426,16 @@ def train(args):
 
                 residual = model(xb)
                 residual = torch.tanh(residual) * 0.3
-                y_hat = torch.clamp(xb + residual, 0.0, 1.0)
+                pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-                loss = F.l1_loss(y_hat, yb)
+                loss = F.l1_loss(pred, yb)
                 val_running += loss.item() * xb.size(0)
 
         val_l1 = val_running / len(val_ds)
-        print(f"Epoch {epoch} done | Train L1: {train_l1:.4f} | Val L1: {val_l1:.4f}")
+        print(
+            f"Epoch {epoch} done | Train L1: {train_total:.4f} "
+            f"(bg={train_bg:.4f}, id={train_id:.4f}) | Val L1: {val_l1:.4f}"
+        )
 
         # Generate previews if enabled
         if args.preview_every > 0 and epoch % args.preview_every == 0:
@@ -490,6 +508,12 @@ def parse_args():
                    help="Generate preview triplets every N epochs (0 to disable)")
     p.add_argument("--gcs_backup_dir", type=str, default="",
                    help="GCS path to backup model_dir (e.g., gs://bucket/path). Empty to disable.")
+    p.add_argument(
+        "--identity_weight",
+        type=float,
+        default=0.3,
+        help="Weight for identity (input-preservation) loss term",
+    )
 
     return p.parse_args()
 

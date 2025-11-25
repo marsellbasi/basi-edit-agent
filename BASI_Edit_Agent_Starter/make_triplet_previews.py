@@ -18,6 +18,12 @@ def parse_args():
     parser.add_argument("--after_glob", required=True, type=str)
     parser.add_argument("--model_ckpt", required=True, type=str)
     parser.add_argument("--out_dir", required=True, type=str)
+    parser.add_argument(
+        "--residual_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for residual before adding to input (e.g., 0.5 for milder effect)",
+    )
     parser.add_argument("--save_residual_maps", action="store_true", default=False,
                        help="Also save grayscale residual magnitude maps for debugging")
     return parser.parse_args()
@@ -86,10 +92,12 @@ def main():
             residual = model(xb)
             # Apply same scaling as training: tanh * 0.3
             residual = torch.tanh(residual) * 0.3
+            # Allow an additional user-controlled scale for previews
+            residual_scaled = args.residual_scale * residual
             # Reconstruct prediction: inputs are [0,1], so just add and clamp
-            pred = torch.clamp(xb + residual, 0.0, 1.0).squeeze(0).cpu()
-            # Keep scaled residual for magnitude map if needed
-            residual_scaled = residual.squeeze(0).cpu()
+            pred = torch.clamp(xb + residual_scaled, 0.0, 1.0).squeeze(0).cpu()
+            # Keep the scaled residual for magnitude map if needed
+            residual_for_map = residual_scaled.squeeze(0).cpu()
 
         model_pil = to_pil(pred)
         before_pil = to_pil(before_tensor.cpu())
@@ -116,7 +124,7 @@ def main():
         # Save residual magnitude map if requested
         if args.save_residual_maps:
             # Compute L2 norm across channels: (H, W)
-            residual_mag = torch.norm(residual_scaled, dim=0)
+            residual_mag = torch.norm(residual_for_map, dim=0)
             # Normalize to [0, 1] for visualization
             residual_mag = residual_mag / (residual_mag.max() + 1e-8)
             # Convert to PIL grayscale
