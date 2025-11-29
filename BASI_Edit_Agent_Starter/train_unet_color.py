@@ -55,18 +55,28 @@ def train(args):
     unet_cfg = cfg.get("color_model", {}).get("unet", {})
     training_cfg = cfg.get("training", {}).get("unet_color", {})
 
+    # Cast config values to correct types (YAML may read them as strings)
+    lr = float(training_cfg.get("lr", 1.0e-4))
+    weight_decay = float(training_cfg.get("weight_decay", 0.0))
+    batch_size = int(training_cfg.get("batch_size", 2)) if not args.batch_size else args.batch_size
+    max_side = int(training_cfg.get("max_side", 1024)) if not args.max_side else args.max_side
+    num_workers = int(training_cfg.get("num_workers", 0))
+    epochs = int(training_cfg.get("epochs", 20)) if not args.epochs else args.epochs
+    save_every = int(training_cfg.get("save_every", 1))
+    
+    # Loss weights
+    loss_cfg = training_cfg.get("loss", {})
+    l1_weight = float(loss_cfg.get("l1_weight", 1.0))
+
     # Load data (reuse existing dataset loading)
     ds_root = dataset_root
     print("Dataset root:", ds_root)
-    max_side = args.max_side if args.max_side else training_cfg.get("max_side", 1024)
     train_pairs = load_pairs(ds_root, args.dataset_version, "train", max_side)
     val_pairs = load_pairs(ds_root, args.dataset_version, "val", max_side)
 
     print(f"Train pairs: {len(train_pairs)} | Val pairs: {len(val_pairs)}")
 
     # DataLoaders
-    batch_size = args.batch_size if args.batch_size else training_cfg.get("batch_size", 2)
-    num_workers = training_cfg.get("num_workers", 0)
     train_loader = DataLoader(train_pairs, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_pairs, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
@@ -76,13 +86,7 @@ def train(args):
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Optimizer
-    lr = training_cfg.get("lr", 1.0e-4)
-    weight_decay = training_cfg.get("weight_decay", 0.0)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # Loss weights
-    loss_cfg = training_cfg.get("loss", {})
-    l1_weight = loss_cfg.get("l1_weight", 1.0)
 
     # Checkpoint directory
     model_dir = args.model_dir if args.model_dir else training_cfg.get("model_dir", "checkpoints/unet_color")
@@ -110,9 +114,6 @@ def train(args):
         print("Starting training from scratch.")
 
     # Training loop
-    epochs = args.epochs if args.epochs else training_cfg.get("epochs", 20)
-    save_every = training_cfg.get("save_every", 1)
-
     for epoch in range(start_epoch, epochs + 1):
         model.train()
         train_loss = 0.0
