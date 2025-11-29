@@ -58,7 +58,6 @@ def train(args):
     # Cast config values to correct types (YAML may read them as strings)
     lr = float(training_cfg.get("lr", 1.0e-4))
     weight_decay = float(training_cfg.get("weight_decay", 0.0))
-    batch_size = int(training_cfg.get("batch_size", 2)) if not args.batch_size else args.batch_size
     max_side = int(training_cfg.get("max_side", 1024)) if not args.max_side else args.max_side
     num_workers = int(training_cfg.get("num_workers", 0))
     epochs = int(training_cfg.get("epochs", 20)) if not args.epochs else args.epochs
@@ -67,6 +66,11 @@ def train(args):
     # Loss weights
     loss_cfg = training_cfg.get("loss", {})
     l1_weight = float(loss_cfg.get("l1_weight", 1.0))
+
+    # Ignore any batch_size from config/args for now.
+    # Use batch_size=1 to avoid size mismatch errors when images have different dimensions.
+    train_batch_size = 1
+    val_batch_size = 1
 
     # Load data (reuse existing dataset loading)
     ds_root = dataset_root
@@ -77,8 +81,20 @@ def train(args):
     print(f"Train pairs: {len(train_pairs)} | Val pairs: {len(val_pairs)}")
 
     # DataLoaders
-    train_loader = DataLoader(train_pairs, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_pairs, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    train_loader = DataLoader(
+        train_pairs,
+        batch_size=train_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_pairs,
+        batch_size=val_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
     # Build model
     model = build_unet_color_model_from_config({"color_model": {"unet": unet_cfg}})
