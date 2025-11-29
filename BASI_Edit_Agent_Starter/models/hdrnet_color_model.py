@@ -65,9 +65,9 @@ def apply_affine_coeffs(x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
 
 class BilateralSlice(nn.Module):
     """
-    Trilinear bilateral slicing for HDRNet-style grids.
+    Bilateral slicing using torch.nn.functional.grid_sample.
 
-    Input grid layout: [B, C, Dg, Hg, Wg]
+    Grid layout: [B, C, Dg, Hg, Wg]
     Guide: [B, 1, H, W] in [0, 1]
     Output: [B, C, H, W]
     """
@@ -81,95 +81,46 @@ class BilateralSlice(nn.Module):
         guide: torch.Tensor,
         output_size: Tuple[int, int],
     ) -> torch.Tensor:
-        """
-        Args:
-            grid:  [B, C, Dg, Hg, Wg]
-            guide: [B, 1, H, W] in [0, 1]
-            output_size: (H, W) of the target image
-
-        Returns:
-            sliced: [B, C, H, W]
-        """
         B, C, Dg, Hg, Wg = grid.shape
         Bg, _, H, W = guide.shape
         assert B == Bg, f"Batch mismatch: grid B={B}, guide B={Bg}"
-        assert output_size == (H, W), f"Expected output_size {(H,W)}, got {output_size}"
+        assert output_size == (H, W), f"Expected output_size {(H, W)}, got {output_size}"
 
         device = grid.device
         dtype = grid.dtype
 
-        # Normalize spatial coordinates to [0, Hg-1] and [0, Wg-1]
-        ys = torch.linspace(0.0, Hg - 1, H, device=device, dtype=dtype)
-        xs = torch.linspace(0.0, Wg - 1, W, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [H, W], [H, W]
+        # Normalize spatial coordinates to [-1, 1]
+        # y: 0..Hg-1 -> -1..1, x: 0..Wg-1 -> -1..1
+        ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [H, W]
+
         yy = yy.unsqueeze(0).expand(B, H, W)  # [B, H, W]
         xx = xx.unsqueeze(0).expand(B, H, W)  # [B, H, W]
 
-        # Depth coordinate from guide: [0, Dg-1]
-        z = guide.squeeze(1).clamp(0.0, 1.0) * (Dg - 1)  # [B, H, W]
+        # Depth from guide: map [0,1] -> [-1,1]
+        z = guide.squeeze(1).clamp(0.0, 1.0)  # [B, H, W]
+        zz = 2.0 * z - 1.0                    # [-1, 1]
 
-        # Compute base indices and interpolation weights
-        x0 = torch.floor(xx).clamp(0, Wg - 1)
-        y0 = torch.floor(yy).clamp(0, Hg - 1)
-        z0 = torch.floor(z).clamp(0, Dg - 1)
+        # Stack into grid_sample coordinates
+        # For 5D input [B, C, Dg, Hg, Wg], grid_sample expects grid [B, D_out, H_out, W_out, 3]
+        # We need to add a D dimension (depth) to the grid
+        sample_grid = torch.stack([xx, yy, zz], dim=-1)  # [B, H, W, 3]
+        # Reshape to [B, 1, H, W, 3] for 5D grid_sample
+        sample_grid = sample_grid.unsqueeze(1)  # [B, 1, H, W, 3]
 
-        x1 = (x0 + 1).clamp(0, Wg - 1)
-        y1 = (y0 + 1).clamp(0, Hg - 1)
-        z1 = (z0 + 1).clamp(0, Dg - 1)
+        # grid_sample for 5D input: expects input [B, C, Dg, Hg, Wg] and grid [B, D_out, H_out, W_out, 3]
+        # and returns [B, C, D_out, H_out, W_out]
+        sliced = F.grid_sample(
+            grid,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )  # [B, C, 1, H, W]
 
-        wx = xx - x0
-        wy = yy - y0
-        wz = z - z0
-
-        x0 = x0.long()
-        x1 = x1.long()
-        y0 = y0.long()
-        y1 = y1.long()
-        z0 = z0.long()
-        z1 = z1.long()
-
-        def sample(d, h, w):
-            # grid: [B, C, Dg, Hg, Wg]
-            # d, h, w: [B, H, W] each (long tensors)
-            # Use advanced indexing: create batch indices that match spatial dimensions
-            batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)  # [B, H, W]
-            # Advanced indexing: grid[batch_idx, :, d, h, w] gives [B, H, W, C]
-            sampled = grid[batch_idx, :, d, h, w]  # [B, H, W, C]
-            return sampled.permute(0, 3, 1, 2)  # [B, C, H, W]
-
-        c000 = sample(z0, y0, x0)
-        c001 = sample(z0, y0, x1)
-        c010 = sample(z0, y1, x0)
-        c011 = sample(z0, y1, x1)
-        c100 = sample(z1, y0, x0)
-        c101 = sample(z1, y0, x1)
-        c110 = sample(z1, y1, x0)
-        c111 = sample(z1, y1, x1)
-
-        # Trilinear interpolation
-        wx0 = 1.0 - wx
-        wy0 = 1.0 - wy
-        wz0 = 1.0 - wz
-
-        w000 = (wx0 * wy0 * wz0).unsqueeze(1)
-        w001 = (wx * wy0 * wz0).unsqueeze(1)
-        w010 = (wx0 * wy * wz0).unsqueeze(1)
-        w011 = (wx * wy * wz0).unsqueeze(1)
-        w100 = (wx0 * wy0 * wz).unsqueeze(1)
-        w101 = (wx * wy0 * wz).unsqueeze(1)
-        w110 = (wx0 * wy * wz).unsqueeze(1)
-        w111 = (wx * wy * wz).unsqueeze(1)
-
-        sliced = (
-            w000 * c000
-            + w001 * c001
-            + w010 * c010
-            + w011 * c011
-            + w100 * c100
-            + w101 * c101
-            + w110 * c110
-            + w111 * c111
-        )  # [B, C, H, W]
+        # Squeeze the D dimension: [B, C, 1, H, W] -> [B, C, H, W]
+        sliced = sliced.squeeze(2)  # [B, C, H, W]
 
         return sliced
 
