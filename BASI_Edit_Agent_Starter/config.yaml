@@ -41,4 +41,17 @@ training:
     save_every: 1
     loss:
       l1_weight: 1.0
+  bg_residual:
+    lr: 1e-4
+    weight_decay: 0.0
+    batch_size: 2
+    num_workers: 0
+    epochs: 20
+    save_every: 1
+    model_dir: "checkpoints/bg_residual"
+    dataset_version: "bg_v1"
+    max_side: 1024
+    identity_weight: 0.3
+    loss:
+      l1_weight: 1.0
 

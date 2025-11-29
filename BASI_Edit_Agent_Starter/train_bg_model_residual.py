@@ -1,8 +1,5 @@
-# scroll to "class BgDataset(Dataset):" and replace that whole class
-# with the version above, then:
-#   Ctrl+O, Enter to save
-#   Ctrl+X to exit
 import argparse, os, glob, subprocess
+import yaml
 from PIL import Image
 
 import torch
@@ -116,11 +113,17 @@ class BgResidualNet(nn.Module):
     """
     Fully convolutional, predicts a residual image R, then we use:
         y_hat = clamp(x + R, 0, 1)
+    
+    Supports optional mask channel: if use_mask=True, expects 4-channel input [R, G, B, mask].
+    If use_mask=False, expects 3-channel RGB input.
     """
-    def __init__(self, in_ch=3, base_ch=32):
+    def __init__(self, in_ch=3, base_ch=32, use_mask=False):
         super().__init__()
+        self.use_mask = use_mask
+        # If using mask, input is 4 channels (RGB + mask), otherwise 3
+        actual_in_ch = 4 if use_mask else in_ch
 
-        self.down1 = ConvBlock(in_ch, base_ch)
+        self.down1 = ConvBlock(actual_in_ch, base_ch)
         self.down2 = ConvBlock(base_ch, base_ch * 2)
         self.down3 = ConvBlock(base_ch * 2, base_ch * 4)
 
@@ -178,6 +181,17 @@ class BgResidualNet(nn.Module):
         # Residual (unconstrained); we clamp after adding back to x
         residual = self.out_conv(u1)
         return residual
+    
+    def forward_with_mask(self, x, mask):
+        """
+        Forward pass with mask channel concatenated.
+        x: [B, 3, H, W] RGB image
+        mask: [B, 1, H, W] or [B, H, W] subject mask (1.0 on subject, 0.0 on background)
+        """
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
+        x_with_mask = torch.cat([x, mask], dim=1)  # [B, 4, H, W]
+        return self.forward(x_with_mask)
 
 def collate_pairs(batch):
     """
@@ -272,7 +286,25 @@ def generate_previews(model, val_ds, device, output_dir, max_samples=6):
 # -----------------------------
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    
+    # ----- Logging startup info -----
+    print("=" * 60)
+    print("BASI Background Residual Model Training (Stage 2)")
+    print("=" * 60)
+    print(f"Device: {device}")
+    print(f"Dataset version: {args.dataset_version}")
+    print(f"Train before glob: {args.train_before_glob}")
+    print(f"Train after glob: {args.train_after_glob}")
+    print(f"Val before glob: {args.val_before_glob}")
+    print(f"Val after glob: {args.val_after_glob}")
+    print(f"Max side: {args.max_side}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Identity weight: {args.identity_weight}")
+    print(f"Model directory: {args.model_dir}")
+    print(f"Use mask: {args.use_mask}")
+    print("=" * 60)
 
     # ----- datasets -----
     train_ds = BgDataset(
@@ -288,8 +320,21 @@ def train(args):
         is_train=False,
     )
 
-    # Debug: how many pairs we actually have
+    # Check if masks are available
+    has_masks = False
+    if args.use_mask:
+        # Check first few samples for mask availability
+        for i in range(min(5, len(train_ds))):
+            _, _, m = train_ds[i]
+            if m is not None:
+                has_masks = True
+                break
+    
     print(f"Train pairs: {len(train_ds)} | Val pairs: {len(val_ds)}")
+    if args.use_mask:
+        print(f"Mask support: {'Enabled (masks found)' if has_masks else 'Enabled (no masks found, will use fallback)'}")
+    else:
+        print("Mask support: Disabled")
 
     # Create model
 
@@ -370,11 +415,18 @@ def train(args):
         collate_fn=collate_fn,
     )
 
-    # ----- create model / optimizer exactly like you had before -----
+    # ----- create model / optimizer -----
     # -------------------------------------------------
     # Model
     # -------------------------------------------------
-    model = BgResidualNet(in_ch=3, base_ch=32).to(device)
+    model = BgResidualNet(in_ch=3, base_ch=32, use_mask=args.use_mask and has_masks).to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    print(f"Checkpoints will be saved to: {args.model_dir}")
+    print("=" * 60)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -386,8 +438,8 @@ def train(args):
         if args.resume_ckpt:
             ckpt_path = args.resume_ckpt
         else:
-            # Auto-resume from bg_residual_last.pt in model_dir
-            ckpt_path = os.path.join(args.model_dir, "bg_residual_last.pt")
+            # Auto-resume from latest.pt in model_dir
+            ckpt_path = os.path.join(args.model_dir, "latest.pt")
         
         if os.path.exists(ckpt_path):
             print(f"Loading checkpoint from {ckpt_path}")
@@ -402,6 +454,8 @@ def train(args):
                 print(f"Warning: checkpoint {ckpt_path} not found, starting fresh")
             else:
                 print(f"Warning: auto-resume checkpoint {ckpt_path} not found, starting fresh")
+    
+    print()  # Empty line before training starts
 
     identity_weight = args.identity_weight
 
@@ -437,7 +491,11 @@ def train(args):
 
             optimizer.zero_grad()
 
-            residual = model(xb)
+            # Forward pass: use mask if model supports it
+            if model.use_mask and mb is not None:
+                residual = model.forward_with_mask(xb, mb)
+            else:
+                residual = model(xb)
             # scale residual to be reasonably small at the start
             residual = torch.tanh(residual) * 0.3
             pred = torch.clamp(xb + residual, 0.0, 1.0)
@@ -479,7 +537,11 @@ def train(args):
                 else:
                     bg_mask = torch.ones_like(xb[:, :1, :, :])
 
-                residual = model(xb)
+                # Forward pass: use mask if model supports it
+                if model.use_mask and mb is not None:
+                    residual = model.forward_with_mask(xb, mb)
+                else:
+                    residual = model(xb)
                 residual = torch.tanh(residual) * 0.3
                 pred = torch.clamp(xb + residual, 0.0, 1.0)
 
@@ -500,7 +562,7 @@ def train(args):
 
         # Save last checkpoint
         os.makedirs(args.model_dir, exist_ok=True)
-        last_ckpt_path = os.path.join(args.model_dir, "bg_residual_last.pt")
+        last_ckpt_path = os.path.join(args.model_dir, "latest.pt")
         torch.save(
             {
                 "epoch": epoch,
@@ -511,10 +573,23 @@ def train(args):
             },
             last_ckpt_path,
         )
+        
+        # Also save as epoch checkpoint
+        epoch_ckpt_path = os.path.join(args.model_dir, f"epoch_{epoch:03d}.pt")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_l1": val_l1,
+                "best_val": best_val,
+            },
+            epoch_ckpt_path,
+        )
 
         if val_l1 < best_val:
             best_val = val_l1
-            ckpt_path = os.path.join(args.model_dir, "bg_residual_best.pt")
+            ckpt_path = os.path.join(args.model_dir, "best.pt")
             torch.save(
                 {
                     "epoch": epoch,
@@ -537,23 +612,33 @@ def train(args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Train BASI Background Residual Model (Stage 2)")
+    
+    p.add_argument("--config", type=str, default="config.yaml",
+                   help="Path to config.yaml file")
+    p.add_argument("--dataset_version", type=str, default=None,
+                   help="Dataset version (overrides config)")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Number of epochs (overrides config)")
+    p.add_argument("--batch_size", type=int, default=None,
+                   help="Batch size (overrides config)")
+    p.add_argument("--max_side", type=int, default=None,
+                   help="Max side length (overrides config)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="Learning rate (overrides config)")
+    p.add_argument("--model_dir", type=str, default=None,
+                   help="Model directory (overrides config)")
+    p.add_argument("--identity_weight", type=float, default=None,
+                   help="Identity weight (overrides config)")
 
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--max_side", type=int, default=1024)
-    p.add_argument("--lr", type=float, default=1e-4)
-
-    p.add_argument("--model_dir", type=str, default="BASI_ARCHIVE/models/bg_v2")
-
-    p.add_argument("--train_before_glob", type=str,
-                   default="BASI_EDIT_AGENT/bg_v1/train/before/*.jpg")
-    p.add_argument("--train_after_glob", type=str,
-                   default="BASI_EDIT_AGENT/bg_v1/train/after/*.jpg")
-    p.add_argument("--val_before_glob", type=str,
-                   default="BASI_EDIT_AGENT/bg_v1/val/before/*.jpg")
-    p.add_argument("--val_after_glob", type=str,
-                   default="BASI_EDIT_AGENT/bg_v1/val/after/*.jpg")
+    p.add_argument("--train_before_glob", type=str, default=None,
+                   help="Glob for training before images (overrides dataset_version)")
+    p.add_argument("--train_after_glob", type=str, default=None,
+                   help="Glob for training after images (overrides dataset_version)")
+    p.add_argument("--val_before_glob", type=str, default=None,
+                   help="Glob for validation before images (overrides dataset_version)")
+    p.add_argument("--val_after_glob", type=str, default=None,
+                   help="Glob for validation after images (overrides dataset_version)")
 
     p.add_argument("--resume", action="store_true",
                    help="Resume training from checkpoint")
@@ -563,14 +648,45 @@ def parse_args():
                    help="Generate preview triplets every N epochs (0 to disable)")
     p.add_argument("--gcs_backup_dir", type=str, default="",
                    help="GCS path to backup model_dir (e.g., gs://bucket/path). Empty to disable.")
-    p.add_argument(
-        "--identity_weight",
-        type=float,
-        default=0.3,
-        help="Weight for identity (input-preservation) loss term",
-    )
+    p.add_argument("--use_mask", action="store_true",
+                   help="Use subject mask as 4th channel input (if masks are available)")
 
-    return p.parse_args()
+    args = p.parse_args()
+    
+    # Load config
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+    
+    bg_cfg = config.get("training", {}).get("bg_residual", {})
+    dataset_root = config.get("dataset_root", "BASI_EDIT_AGENT")
+    
+    # Set defaults from config if not provided via CLI
+    if args.dataset_version is None:
+        args.dataset_version = bg_cfg.get("dataset_version", "bg_v1")
+    if args.epochs is None:
+        args.epochs = bg_cfg.get("epochs", 20)
+    if args.batch_size is None:
+        args.batch_size = bg_cfg.get("batch_size", 2)
+    if args.max_side is None:
+        args.max_side = bg_cfg.get("max_side", 1024)
+    if args.lr is None:
+        args.lr = bg_cfg.get("lr", 1e-4)
+    if args.model_dir is None:
+        args.model_dir = bg_cfg.get("model_dir", "checkpoints/bg_residual")
+    if args.identity_weight is None:
+        args.identity_weight = bg_cfg.get("identity_weight", 0.3)
+    
+    # Build globs from dataset_version if not provided
+    if args.train_before_glob is None:
+        args.train_before_glob = os.path.join(dataset_root, args.dataset_version, "train", "before", "*.jpg")
+    if args.train_after_glob is None:
+        args.train_after_glob = os.path.join(dataset_root, args.dataset_version, "train", "after", "*.jpg")
+    if args.val_before_glob is None:
+        args.val_before_glob = os.path.join(dataset_root, args.dataset_version, "val", "before", "*.jpg")
+    if args.val_after_glob is None:
+        args.val_after_glob = os.path.join(dataset_root, args.dataset_version, "val", "after", "*.jpg")
+    
+    return args
 
 
 if __name__ == "__main__":
