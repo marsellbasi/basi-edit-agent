@@ -4,13 +4,19 @@ random_seed: 42
 
 # Color model configuration
 color_model:
-  type: "baseline"  # options: "baseline", "hdrnet"
+  type: "unet"  # options: "baseline", "hdrnet", "unet"
+  baseline: {}  # Baseline model uses default parameters
   hdrnet:
     bilateral_grid_size: [16, 16, 8]
     lowres_channels: 16
     hidden_dim: 64
     num_affine_params: 12
     input_downsample: 256
+  unet:
+    base_channels: 32
+    num_down: 4         # encoder depth
+    use_batchnorm: true
+    residual: true      # model predicts residuals to add to input
 
 # Training configuration
 training:
@@ -24,4 +30,15 @@ training:
     loss:
       l1_weight: 1.0
       ssim_weight: 0.0  # SSIM loss not implemented yet
+  unet_color:
+    lr: 1e-4
+    weight_decay: 0.0
+    batch_size: 2
+    epochs: 20
+    max_side: 1024
+    model_dir: "checkpoints/unet_color"
+    num_workers: 0
+    save_every: 1
+    loss:
+      l1_weight: 1.0
 

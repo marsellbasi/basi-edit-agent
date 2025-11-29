@@ -9,10 +9,16 @@ from .hdrnet_color_model import (
     BilateralSlice,
     build_hdrnet_color_model_from_config,
 )
+from .unet_color_model import (
+    UNetColorModel,
+    build_unet_color_model_from_config,
+)
 
 __all__ = [
     "HDRNetColorModel",
     "BilateralSlice",
     "build_hdrnet_color_model_from_config",
+    "UNetColorModel",
+    "build_unet_color_model_from_config",
 ]
 

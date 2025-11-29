@@ -92,7 +92,14 @@ Or rely on `~/.bashrc` sourcing (automatically added by bootstrap).
 
 ## Stage 1 – Global Color Model
 
+The BASI Edit Agent supports three Stage 1 color models:
+- **Baseline**: Simple global affine + tone curves (original model)
+- **HDRNet**: Bilateral grid-based color/tone model (experimental)
+- **UNet**: Lightweight U-Net predicting color residuals (default, recommended)
+
 ### Train Stage 1 color model
+
+**Baseline model:**
 ```bash
 cd /workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter
 chmod +x train_stage1_color.sh
@@ -105,20 +112,57 @@ EPOCHS=10 ./train_stage1_color.sh
 
 The script will automatically resume if it finds an existing checkpoint at `BASI_ARCHIVE/models/color_v0/color_model.json`.
 
+**UNet model (recommended):**
+```bash
+cd /workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter
+python train_unet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20
+```
+
+Checkpoints are saved to `checkpoints/unet_color/epoch_{:03d}.pt` and `checkpoints/unet_color/latest.pt`.
+
+**HDRNet model (experimental):**
+```bash
+cd /workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter
+python train_hdrnet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20
+```
+
+Checkpoints are saved to `checkpoints/hdrnet_color/epoch_{:03d}.pt` and `checkpoints/hdrnet_color/latest.pt`.
+
 ### Apply Stage 1 to a folder
+
+The model type is determined by `color_model.type` in `config.yaml` (default: "unet").
+
+**UNet (default):**
 ```bash
 python3 apply_color_model.py \
+  --config config.yaml \
+  --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --output_dir "BASI_EDIT_AGENT/stage1_unet/val_e20" \
+  --model_ckpt "checkpoints/unet_color/latest.pt"
+```
+
+**Baseline:**
+```bash
+python3 apply_color_model.py \
+  --config config.yaml \
   --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
   --output_dir "BASI_EDIT_AGENT/stage1_color_only/val_e20" \
   --model_ckpt "checkpoints/color_v1_e20/color_model.json"
 ```
 
-Or use the default checkpoint location:
+**HDRNet:**
 ```bash
 python3 apply_color_model.py \
+  --config config.yaml \
   --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
-  --output_dir "BASI_EDIT_AGENT/stage1_color_only/val_e20" \
-  --model_ckpt "BASI_ARCHIVE/models/color_v0/color_model.json"
+  --output_dir "BASI_EDIT_AGENT/stage1_hdrnet/val_e20" \
+  --model_ckpt "checkpoints/hdrnet_color/latest.pt"
 ```
 
 ### Combine with Stage 2 triplets
@@ -249,6 +293,99 @@ To switch between baseline and HDRNet models, simply change `color_model.type` i
 - `"hdrnet"`: Uses the HDRNet model (PyTorch checkpoint)
 
 The `apply_color_model.py` script automatically selects the correct model type based on the config or checkpoint file extension.
+
+---
+
+## Stage 1 – U-Net Color Model (Default)
+
+The U-Net color model is the default Stage 1 color model, providing high-quality color/tone adjustments without the banding artifacts sometimes seen in HDRNet. It uses a lightweight U-Net architecture to predict residual color adjustments.
+
+### Architecture
+
+The U-Net model:
+- **Encoder**: Downsampling via stride-2 convolutions with skip connections
+- **Bottleneck**: Feature processing at the lowest resolution
+- **Decoder**: Upsampling with skip connections from encoder
+- **Output**: 3-channel residual added to input image
+
+### Training the U-Net Color Model
+
+```bash
+cd BASI_Edit_Agent_Starter
+python train_unet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20
+```
+
+**Command-line options:**
+- `--config`: Path to YAML config file (required)
+- `--dataset_version`: Dataset version (e.g., `dataset_v1`)
+- `--epochs`: Number of training epochs (overrides config if provided)
+- `--max_side`: Maximum side length for image resizing (default: 1024)
+- `--batch_size`: Batch size (overrides config if provided)
+- `--model_dir`: Model checkpoint directory (overrides config if provided)
+- `--resume_ckpt`: Path to checkpoint to resume from
+- `--resume`: Resume from latest checkpoint if it exists
+
+**Checkpoints:**
+- Saved to `checkpoints/unet_color/epoch_{:03d}.pt`
+- Latest checkpoint: `checkpoints/unet_color/latest.pt`
+- Each checkpoint includes model state, optimizer state, epoch number, and config
+
+**Resuming training:**
+```bash
+# Resume from latest checkpoint
+python train_unet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20 \
+  --resume
+
+# Resume from specific checkpoint
+python train_unet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20 \
+  --resume_ckpt checkpoints/unet_color/epoch_010.pt
+```
+
+### Running Inference with U-Net
+
+U-Net is the default model type. To use it explicitly:
+
+1. Set `color_model.type: "unet"` in `config.yaml` (this is the default)
+2. Run inference:
+```bash
+python apply_color_model.py \
+  --config config.yaml \
+  --input_glob "path/to/images/*.jpg" \
+  --output_dir "output/" \
+  --model_ckpt "checkpoints/unet_color/latest.pt"
+```
+
+### Configuration
+
+U-Net model parameters are configured in `config.yaml`:
+
+```yaml
+color_model:
+  type: "unet"  # Default
+  unet:
+    base_channels: 32
+    num_down: 4         # encoder depth
+    use_batchnorm: true
+    residual: true      # model predicts residuals to add to input
+
+training:
+  unet_color:
+    lr: 1e-4
+    weight_decay: 0.0
+    batch_size: 2
+    epochs: 20
+    max_side: 1024
+    model_dir: "checkpoints/unet_color"
+```
 
 ---
 

@@ -117,6 +117,65 @@ def apply_hdrnet_transform(arr, model, device, max_side=None):
     return out
 
 
+def load_unet_model(model_ckpt: str, config_path: str = None):
+    """Load U-Net color model from PyTorch checkpoint."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load config if provided
+    if config_path:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        unet_cfg = cfg.get("color_model", {}).get("unet", {})
+    else:
+        unet_cfg = {}
+    
+    # Import UNet model
+    from models.unet_color_model import build_unet_color_model_from_config
+    
+    # Load checkpoint
+    ckpt = torch.load(model_ckpt, map_location=device)
+    
+    # Get config from checkpoint if available
+    if "config" in ckpt:
+        unet_cfg = ckpt["config"]
+    
+    # Build model
+    model = build_unet_color_model_from_config({"color_model": {"unet": unet_cfg}})
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    
+    return model, device
+
+
+def apply_unet_transform(arr, model, device, max_side=None):
+    """Apply U-Net color transform to image array."""
+    # Resize if max_side is specified
+    h, w = arr.shape[:2]
+    if max_side is not None:
+        scale = min(1.0, max_side / max(h, w))
+        if scale < 1.0:
+            img = Image.fromarray(arr)
+            new_size = (int(round(w * scale)), int(round(h * scale)))
+            img = img.resize(new_size, Image.LANCZOS)
+            arr = np.array(img)
+            h, w = arr.shape[:2]
+
+    # Convert to tensor: [H, W, 3] -> [1, 3, H, W]
+    x = arr.astype(np.float32) / 255.0
+    x_tensor = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device)
+    
+    # Apply model
+    with torch.no_grad():
+        y_tensor = model(x_tensor)
+    
+    # Convert back to numpy: [1, 3, H, W] -> [H, W, 3]
+    y = y_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    y = np.clip(y, 0, 1)
+    out = (y * 255.0 + 0.5).astype(np.uint8)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Apply Stage 1 global color model to images."
@@ -167,35 +226,30 @@ def main():
     if args.config:
         with open(args.config, "r") as f:
             cfg = yaml.safe_load(f)
-        model_type = cfg.get("color_model", {}).get("type", "baseline")
+        model_type = cfg.get("color_model", {}).get("type", "unet")  # Default to unet
     
-    # If model_ckpt provided, infer type from extension
-    if args.model_ckpt:
+    # If model_ckpt provided and no config, infer type from extension
+    if args.model_ckpt and model_type is None:
         if args.model_ckpt.endswith(".pt") or args.model_ckpt.endswith(".pth"):
-            model_type = "hdrnet"
+            # Can't distinguish between hdrnet and unet from extension alone
+            # Default to unet if config not provided
+            model_type = "unet"
         elif args.model_ckpt.endswith(".json"):
             model_type = "baseline"
     
-    # Default to baseline if not determined
+    # Default to unet if not determined
     if model_type is None:
-        model_type = "baseline"
+        model_type = "unet"
     
     print(f"Using model type: {model_type}")
     
     # Load model
-    if model_type == "hdrnet":
-        if not args.model_ckpt:
-            # Try to find default HDRNet checkpoint
-            default_ckpt = "checkpoints/hdrnet_color/latest.pt"
-            if os.path.exists(default_ckpt):
-                args.model_ckpt = default_ckpt
-            else:
-                raise ValueError("HDRNet model requires --model_ckpt or config must specify checkpoint path")
-        
-        print(f"Loading HDRNet model from: {args.model_ckpt}")
-        hdrnet_model, device = load_hdrnet_model(args.model_ckpt, args.config)
-        baseline_model = None
-    else:
+    baseline_model = None
+    hdrnet_model = None
+    unet_model = None
+    device = None
+    
+    if model_type == "baseline":
         if not args.model_ckpt:
             # Try to find default baseline checkpoint
             default_ckpt = "BASI_ARCHIVE/models/color_v0/color_model.json"
@@ -207,8 +261,33 @@ def main():
         print(f"Loading baseline model from: {args.model_ckpt}")
         M, b, curves = load_baseline_model(args.model_ckpt)
         baseline_model = (M, b, curves)
-        hdrnet_model = None
-        device = None
+    
+    elif model_type == "hdrnet":
+        if not args.model_ckpt:
+            # Try to find default HDRNet checkpoint
+            default_ckpt = "checkpoints/hdrnet_color/latest.pt"
+            if os.path.exists(default_ckpt):
+                args.model_ckpt = default_ckpt
+            else:
+                raise ValueError("HDRNet model requires --model_ckpt or config must specify checkpoint path")
+        
+        print(f"Loading HDRNet model from: {args.model_ckpt}")
+        hdrnet_model, device = load_hdrnet_model(args.model_ckpt, args.config)
+    
+    elif model_type == "unet":
+        if not args.model_ckpt:
+            # Try to find default UNet checkpoint
+            default_ckpt = "checkpoints/unet_color/latest.pt"
+            if os.path.exists(default_ckpt):
+                args.model_ckpt = default_ckpt
+            else:
+                raise ValueError("UNet model requires --model_ckpt or config must specify checkpoint path")
+        
+        print(f"Loading UNet model from: {args.model_ckpt}")
+        unet_model, device = load_unet_model(args.model_ckpt, args.config)
+    
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
     processed = 0
     for src in tqdm(files, desc="Applying color model"):
@@ -216,10 +295,14 @@ def main():
             img = Image.open(src).convert("RGB")
             arr = np.array(img)
             
-            if model_type == "hdrnet":
-                y = apply_hdrnet_transform(arr, hdrnet_model, device, max_side=args.max_side)
-            else:
+            if model_type == "baseline":
                 y = apply_baseline_transform(arr, baseline_model[0], baseline_model[1], baseline_model[2], max_side=args.max_side)
+            elif model_type == "hdrnet":
+                y = apply_hdrnet_transform(arr, hdrnet_model, device, max_side=args.max_side)
+            elif model_type == "unet":
+                y = apply_unet_transform(arr, unet_model, device, max_side=args.max_side)
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
 
             # Save with same basename
             fname = src.name
