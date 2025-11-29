@@ -14,6 +14,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def apply_affine_coeffs(x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
+    """
+    Apply per-pixel affine coefficients to an image.
+    
+    Args:
+        x: Input image [B, 3, H, W] in [0, 1]
+        coeffs: Affine coefficients [B, 12, H, W] (3x4 affine per pixel)
+    
+    Returns:
+        Output image [B, 3, H, W] in [0, 1]
+    """
+    assert x.dim() == 4 and x.size(1) == 3, f"Expected x [B, 3, H, W], got {x.shape}"
+    assert coeffs.dim() == 4 and coeffs.size(1) == 12, f"Expected coeffs [B, 12, H, W], got {coeffs.shape}"
+    
+    B, _, H, W = x.shape
+    
+    # [B, 12, H, W] -> [B, H, W, 12]
+    coeffs = coeffs.permute(0, 2, 3, 1).contiguous()
+    
+    # [B, H, W, 12] -> [B, HW, 3, 4]
+    coeffs = coeffs.view(B, H * W, 3, 4)
+    
+    # Split into weights and bias
+    weights = coeffs[..., :3]   # [B, HW, 3, 3]
+    bias = coeffs[..., 3]       # [B, HW, 3]
+    
+    # Flatten image to [B, HW, 3]
+    x_flat = x.view(B, 3, H * W).permute(0, 2, 1)  # [B, HW, 3]
+    
+    # Apply affine: y = W * x + b
+    x_expanded = x_flat.unsqueeze(-1)              # [B, HW, 3, 1]
+    y_expanded = torch.matmul(weights, x_expanded) # [B, HW, 3, 1]
+    y_flat = y_expanded.squeeze(-1) + bias        # [B, HW, 3]
+    
+    # Back to [B, 3, H, W]
+    y = y_flat.permute(0, 2, 1).view(B, 3, H, W)
+    
+    # Make sure range is reasonable
+    y = torch.clamp(y, 0.0, 1.0)
+    
+    return y
+
+
 class BilateralSlice(nn.Module):
     """
     Bilateral grid slicing operation.
@@ -252,50 +295,10 @@ class HDRNetColorModel(nn.Module):
         assert sliced_coeffs.size(1) == self.num_affine_params, \
             f"Expected {self.num_affine_params} affine channels, got {sliced_coeffs.size(1)}"
         
-        # Reshape affine coefficients to [B, H, W, 12]
-        # Permute from [B, 12, H, W] to [B, H, W, 12]
-        affine = sliced_coeffs.permute(0, 2, 3, 1).contiguous()  # [B, H, W, 12]
+        # Apply affine coefficients to input image
+        y = apply_affine_coeffs(x, sliced_coeffs)
         
-        # Sanity check
-        assert affine.dim() == 4, f"Expected affine [B, H, W, 12], got {affine.shape}"
-        assert affine.size(3) == 12, f"Expected 12 affine channels (3x4), got {affine.size(3)}"
-        
-        # Reshape to [B, H*W, 3, 4] for easier manipulation
-        B_affine, H_affine, W_affine, C_affine = affine.shape
-        assert B_affine == B and H_affine == H and W_affine == W, \
-            f"Affine shape mismatch: affine {affine.shape} vs input {x.shape}"
-        
-        affine = affine.view(B, H * W, 3, 4)  # [B, HW, 3, 4]
-        
-        # Split into weights and bias
-        weights = affine[..., :3]  # [B, HW, 3, 3] - 3x3 weight matrix per pixel
-        bias = affine[..., 3]      # [B, HW, 3] - bias vector per pixel
-        
-        # Flatten input image: [B, 3, H, W] -> [B, HW, 3]
-        x_flat = x.view(B, 3, H * W).permute(0, 2, 1)  # [B, HW, 3]
-        
-        # Apply affine transform using torch.matmul with broadcasting
-        # weights: [B, HW, 3, 3]
-        # x_flat:  [B, HW, 3]
-        # bias:    [B, HW, 3]
-        
-        # Expand x_flat to [B, HW, 3, 1] for matrix multiplication
-        x_expanded = x_flat.unsqueeze(-1)  # [B, HW, 3, 1]
-        
-        # Matrix multiplication: [B, HW, 3, 3] @ [B, HW, 3, 1] -> [B, HW, 3, 1]
-        y_expanded = torch.matmul(weights, x_expanded)  # [B, HW, 3, 1]
-        
-        # Squeeze and add bias: [B, HW, 3, 1] -> [B, HW, 3]
-        y_flat = y_expanded.squeeze(-1) + bias  # [B, HW, 3]
-        
-        # Reshape back to image: [B, HW, 3] -> [B, 3, H, W]
-        y = y_flat.permute(0, 2, 1).view(B, 3, H, W)  # [B, 3, H, W]
-        
-        # Sanity check output shape
-        assert y.shape == x.shape, f"Output shape {y.shape} doesn't match input shape {x.shape}"
-        
-        # Clamp to valid range
-        return y.clamp(0.0, 1.0)
+        return y
 
 
 def build_hdrnet_color_model_from_config(cfg: Dict) -> HDRNetColorModel:
@@ -329,10 +332,34 @@ def build_hdrnet_color_model_from_config(cfg: Dict) -> HDRNetColorModel:
     return model
 
 
+def _test_identity_affine():
+    """Test that identity affine coefficients produce the input image."""
+    B, H, W = 2, 64, 64
+    x = torch.rand(B, 3, H, W)
+    
+    # Build identity affine coeffs: y = x
+    # diag ones for R,G,B
+    coeffs = torch.zeros(B, 12, H, W)
+    coeffs[:, 0, :, :] = 1.0  # R -> R
+    coeffs[:, 4, :, :] = 1.0  # G -> G
+    coeffs[:, 8, :, :] = 1.0  # B -> B
+    
+    y = apply_affine_coeffs(x, coeffs)
+    
+    max_diff = (x - y).abs().max().item()
+    print("Max diff identity test:", max_diff)
+    assert max_diff < 1e-5, f"Identity test failed: max diff = {max_diff}"
+    print("✓ Identity affine test passed!")
+
+
 # Simple test function
 if __name__ == "__main__":
+    # Test identity affine first
+    print("Testing identity affine...")
+    _test_identity_affine()
+    
     # Test that the model works with various batch sizes and image sizes
-    print("Testing HDRNet model...")
+    print("\nTesting HDRNet model...")
     model = HDRNetColorModel()
     
     # Test cases: (batch_size, height, width)
