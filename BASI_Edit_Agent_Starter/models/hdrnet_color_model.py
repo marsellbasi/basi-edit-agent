@@ -65,101 +65,113 @@ def apply_affine_coeffs(x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
 
 class BilateralSlice(nn.Module):
     """
-    Bilateral grid slicing operation.
-    
-    Takes a bilateral grid of affine coefficients and slices it to full resolution
-    using trilinear interpolation based on pixel coordinates and luminance.
+    Trilinear bilateral slicing for HDRNet-style grids.
+
+    Input grid layout: [B, C, Dg, Hg, Wg]
+    Guide: [B, 1, H, W] in [0, 1]
+    Output: [B, C, H, W]
     """
-    
+
     def __init__(self):
         super().__init__()
-    
+
     def forward(
         self,
         grid: torch.Tensor,
         guide: torch.Tensor,
-        input_image: torch.Tensor
+        output_size: Tuple[int, int],
     ) -> torch.Tensor:
         """
-        Slice the bilateral grid to full resolution.
-        
         Args:
-            grid: Bilateral grid of shape [B, C, H_grid, W_grid, D_grid]
-            guide: Guide image (luminance) of shape [B, 1, H, W] in [0, 1]
-            input_image: Full-res input image [B, 3, H, W] for shape reference
-        
+            grid:  [B, C, Dg, Hg, Wg]
+            guide: [B, 1, H, W] in [0, 1]
+            output_size: (H, W) of the target image
+
         Returns:
-            Sliced coefficients of shape [B, C, H, W]
+            sliced: [B, C, H, W]
         """
-        B, C, H_grid, W_grid, D_grid = grid.shape
-        _, _, H, W = input_image.shape
-        
-        # Normalize guide to grid depth coordinates [0, D_grid-1]
-        guide_flat = guide.squeeze(1)  # [B, H, W]
-        d_coords = guide_flat * (D_grid - 1)  # [B, H, W] in [0, D_grid-1]
-        
-        # Get depth indices for trilinear interpolation
-        d_lo = torch.floor(d_coords).long().clamp(0, D_grid - 1)  # [B, H, W]
-        d_hi = torch.clamp(d_lo + 1, max=D_grid - 1)  # [B, H, W]
-        d_w = (d_coords - d_lo.float()).clamp(0, 1)  # [B, H, W]
-        
-        # Create spatial coordinate grids normalized to [-1, 1]
-        y_coords = torch.linspace(-1, 1, H, device=grid.device, dtype=grid.dtype)
-        x_coords = torch.linspace(-1, 1, W, device=grid.device, dtype=grid.dtype)
-        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing='ij')
-        y_grid = y_grid.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
-        x_grid = x_grid.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
-        
-        # Stack for 2D grid_sample: [B, H, W, 2]
-        coords_2d = torch.stack([y_grid, x_grid], dim=-1)  # [B, H, W, 2]
-        
-        # Sample from each depth level and interpolate
-        output_slices = []
-        for d_idx in [d_lo, d_hi]:
-            # For each batch and pixel, get the depth slice
-            # We need to sample per-pixel depth, so we'll use a loop or advanced indexing
-            # More efficient: sample all depth slices and use advanced indexing
-            
-            # Sample each depth slice using 2D grid_sample
-            depth_outputs = []
-            for d in range(D_grid):
-                depth_slice = grid[:, :, :, :, d]  # [B, C, H_grid, W_grid]
-                sampled = F.grid_sample(
-                    depth_slice,
-                    coords_2d,
-                    mode='bilinear',
-                    padding_mode='border',
-                    align_corners=True
-                )  # [B, C, H, W]
-                depth_outputs.append(sampled)
-            
-            # Stack all depth slices: [B, C, H, W, D_grid]
-            all_depths = torch.stack(depth_outputs, dim=-1)
-            
-            # Use advanced indexing to select per-pixel depth
-            # d_idx: [B, H, W], we need to index into last dimension
-            batch_idx = torch.arange(B, device=grid.device).view(B, 1, 1).expand(-1, H, W)
-            h_idx = torch.arange(H, device=grid.device).view(1, H, 1).expand(B, -1, W)
-            w_idx = torch.arange(W, device=grid.device).view(1, 1, W).expand(B, H, -1)
-            
-            # Select: all_depths[b, c, h, w, d_idx[b, h, w]]
-            # Reshape for indexing: [B, C, H*W, D_grid]
-            all_depths_flat = all_depths.view(B, C, H * W, D_grid)
-            d_idx_flat = d_idx.view(B, H * W)  # [B, H*W]
-            
-            # Use gather to select the right depth per pixel
-            d_idx_expanded = d_idx_flat.unsqueeze(1).expand(-1, C, -1)  # [B, C, H*W]
-            d_idx_expanded = d_idx_expanded.unsqueeze(-1)  # [B, C, H*W, 1]
-            selected = torch.gather(all_depths_flat, dim=3, index=d_idx_expanded).squeeze(-1)  # [B, C, H*W]
-            selected = selected.view(B, C, H, W)  # [B, C, H, W]
-            
-            output_slices.append(selected)
-        
-        # Interpolate between depth levels
-        d_w_expanded = d_w.unsqueeze(1)  # [B, 1, H, W]
-        output = (1 - d_w_expanded) * output_slices[0] + d_w_expanded * output_slices[1]
-        
-        return output
+        B, C, Dg, Hg, Wg = grid.shape
+        Bg, _, H, W = guide.shape
+        assert B == Bg, f"Batch mismatch: grid B={B}, guide B={Bg}"
+        assert output_size == (H, W), f"Expected output_size {(H,W)}, got {output_size}"
+
+        device = grid.device
+        dtype = grid.dtype
+
+        # Normalize spatial coordinates to [0, Hg-1] and [0, Wg-1]
+        ys = torch.linspace(0.0, Hg - 1, H, device=device, dtype=dtype)
+        xs = torch.linspace(0.0, Wg - 1, W, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")  # [H, W], [H, W]
+        yy = yy.unsqueeze(0).expand(B, H, W)  # [B, H, W]
+        xx = xx.unsqueeze(0).expand(B, H, W)  # [B, H, W]
+
+        # Depth coordinate from guide: [0, Dg-1]
+        z = guide.squeeze(1).clamp(0.0, 1.0) * (Dg - 1)  # [B, H, W]
+
+        # Compute base indices and interpolation weights
+        x0 = torch.floor(xx).clamp(0, Wg - 1)
+        y0 = torch.floor(yy).clamp(0, Hg - 1)
+        z0 = torch.floor(z).clamp(0, Dg - 1)
+
+        x1 = (x0 + 1).clamp(0, Wg - 1)
+        y1 = (y0 + 1).clamp(0, Hg - 1)
+        z1 = (z0 + 1).clamp(0, Dg - 1)
+
+        wx = xx - x0
+        wy = yy - y0
+        wz = z - z0
+
+        x0 = x0.long()
+        x1 = x1.long()
+        y0 = y0.long()
+        y1 = y1.long()
+        z0 = z0.long()
+        z1 = z1.long()
+
+        def sample(d, h, w):
+            # grid: [B, C, Dg, Hg, Wg]
+            # d, h, w: [B, H, W] each (long tensors)
+            # Use advanced indexing: create batch indices that match spatial dimensions
+            batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, H, W)  # [B, H, W]
+            # Advanced indexing: grid[batch_idx, :, d, h, w] gives [B, H, W, C]
+            sampled = grid[batch_idx, :, d, h, w]  # [B, H, W, C]
+            return sampled.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+        c000 = sample(z0, y0, x0)
+        c001 = sample(z0, y0, x1)
+        c010 = sample(z0, y1, x0)
+        c011 = sample(z0, y1, x1)
+        c100 = sample(z1, y0, x0)
+        c101 = sample(z1, y0, x1)
+        c110 = sample(z1, y1, x0)
+        c111 = sample(z1, y1, x1)
+
+        # Trilinear interpolation
+        wx0 = 1.0 - wx
+        wy0 = 1.0 - wy
+        wz0 = 1.0 - wz
+
+        w000 = (wx0 * wy0 * wz0).unsqueeze(1)
+        w001 = (wx * wy0 * wz0).unsqueeze(1)
+        w010 = (wx0 * wy * wz0).unsqueeze(1)
+        w011 = (wx * wy * wz0).unsqueeze(1)
+        w100 = (wx0 * wy0 * wz).unsqueeze(1)
+        w101 = (wx * wy0 * wz).unsqueeze(1)
+        w110 = (wx0 * wy * wz).unsqueeze(1)
+        w111 = (wx * wy * wz).unsqueeze(1)
+
+        sliced = (
+            w000 * c000
+            + w001 * c001
+            + w010 * c010
+            + w011 * c011
+            + w100 * c100
+            + w101 * c101
+            + w110 * c110
+            + w111 * c111
+        )  # [B, C, H, W]
+
+        return sliced
 
 
 class HDRNetColorModel(nn.Module):
@@ -280,26 +292,29 @@ class HDRNetColorModel(nn.Module):
         # Reshape to bilateral grid
         H_grid, W_grid, D_grid = self.grid_size
         # Resize to grid spatial dimensions
+        # coeffs_flat: [B, num_affine_params * D_grid, H_grid, W_grid]
         coeffs_flat = F.interpolate(
             coeffs_flat,
             size=(H_grid, W_grid),
-            mode='bilinear',
-            align_corners=False
-        )  # [B, grid_channels * D_grid, H_grid, W_grid]
+            mode="bilinear",
+            align_corners=False,
+        )
         
-        # Reshape to grid format: [B, grid_channels, H_grid, W_grid, D_grid]
-        coeffs_grid = coeffs_flat.view(B, self.num_affine_params, D_grid, H_grid, W_grid)
-        coeffs_grid = coeffs_grid.permute(0, 1, 3, 4, 2).contiguous()
-        # Now: [B, grid_channels, H_grid, W_grid, D_grid]
+        # Reshape to [B, C, Dg, Hg, Wg]
+        B_flat, cd, Hg, Wg = coeffs_flat.shape
+        C = self.num_affine_params
+        Dg = cd // C
+        assert cd == C * Dg, f"Expected cd to be divisible by C, got cd={cd}, C={C}"
+        
+        coeffs_grid = coeffs_flat.view(B, C, Dg, Hg, Wg)  # [B, C, Dg, Hg, Wg]
         
         # Slice grid to full resolution
-        # Output: [B, grid_channels, H, W] where grid_channels = num_affine_params (12)
-        sliced_coeffs = self.bilateral_slice(coeffs_grid, guide, x)
+        # guide: [B, 1, H, W]
+        sliced_coeffs = self.bilateral_slice(coeffs_grid, guide, output_size=(H, W))
         
         # Sanity check: sliced_coeffs should be [B, 12, H, W]
-        assert sliced_coeffs.dim() == 4, f"Expected sliced_coeffs [B, 12, H, W], got {sliced_coeffs.shape}"
-        assert sliced_coeffs.size(1) == self.num_affine_params, \
-            f"Expected {self.num_affine_params} affine channels, got {sliced_coeffs.size(1)}"
+        assert sliced_coeffs.shape == (B, self.num_affine_params, H, W), \
+            f"Expected sliced_coeffs shape {(B, self.num_affine_params, H, W)}, got {sliced_coeffs.shape}"
         
         # Apply affine coefficients to input image
         y = apply_affine_coeffs(x, sliced_coeffs)
@@ -357,6 +372,36 @@ def _test_identity_affine():
     print("Max diff (identity test):", max_diff)
 
 
+def _test_full_identity_pipeline():
+    """Test that a constant identity grid + bilateral slice + apply_affine_coeffs reproduces x."""
+    B, H, W = 2, 64, 80
+    x = torch.rand(B, 3, H, W)
+
+    # Make guide arbitrary (but valid)
+    guide = torch.rand(B, 1, H, W)
+
+    C = 12
+    Dg, Hg, Wg = 4, 8, 8
+
+    # Build a grid that is identity everywhere
+    grid = torch.zeros(B, C, Dg, Hg, Wg)
+    # Row 0: [1, 0, 0, 0]
+    grid[:, 0, :, :, :] = 1.0  # a00
+    # Row 1: [0, 1, 0, 0]
+    grid[:, 5, :, :, :] = 1.0  # a11
+    # Row 2: [0, 0, 1, 0]
+    grid[:, 10, :, :, :] = 1.0 # a22
+
+    slicer = BilateralSlice()
+    coeffs = slicer(grid, guide, output_size=(H, W))  # [B, 12, H, W]
+
+    y = apply_affine_coeffs(x, coeffs)
+
+    max_diff = (x - y).abs().max().item()
+    print("Max diff (full identity pipeline):", max_diff)
+
+
 if __name__ == "__main__":
     _test_identity_affine()
+    _test_full_identity_pipeline()
 
