@@ -201,6 +201,10 @@ class HDRNetColorModel(nn.Module):
         Returns:
             Output image [B, 3, H, W] in [0, 1]
         """
+        # Sanity check input shape
+        assert x.dim() == 4 and x.size(1) == 3, \
+            f"Expected x [B, 3, H, W], got {x.shape}"
+        
         B, C, H, W = x.shape
         
         # Compute luminance guide for bilateral slicing
@@ -240,40 +244,55 @@ class HDRNetColorModel(nn.Module):
         # Now: [B, grid_channels, H_grid, W_grid, D_grid]
         
         # Slice grid to full resolution
-        # Output: [B, grid_channels, H, W]
+        # Output: [B, grid_channels, H, W] where grid_channels = num_affine_params (12)
         sliced_coeffs = self.bilateral_slice(coeffs_grid, guide, x)
         
-        # Apply local affine transform
-        # sliced_coeffs: [B, 12, H, W] where 12 = 3 channels * 4 params (3 weights + 1 bias)
-        # For each pixel, we have a 3x4 affine matrix
+        # Sanity check: sliced_coeffs should be [B, 12, H, W]
+        assert sliced_coeffs.dim() == 4, f"Expected sliced_coeffs [B, 12, H, W], got {sliced_coeffs.shape}"
+        assert sliced_coeffs.size(1) == self.num_affine_params, \
+            f"Expected {self.num_affine_params} affine channels, got {sliced_coeffs.size(1)}"
         
-        # Reshape for matrix multiplication
-        # x: [B, 3, H, W] -> [B, 3, H*W]
-        x_flat = x.view(B, 3, H * W)  # [B, 3, H*W]
+        # Reshape affine coefficients to [B, H, W, 12]
+        # Permute from [B, 12, H, W] to [B, H, W, 12]
+        affine = sliced_coeffs.permute(0, 2, 3, 1).contiguous()  # [B, H, W, 12]
         
-        # Reshape coefficients: [B, 12, H, W] -> [B, 3, 4, H*W]
-        coeffs_reshaped = sliced_coeffs.view(B, 3, 4, H * W)  # [B, 3, 4, H*W]
+        # Sanity check
+        assert affine.dim() == 4, f"Expected affine [B, H, W, 12], got {affine.shape}"
+        assert affine.size(3) == 12, f"Expected 12 affine channels (3x4), got {affine.size(3)}"
         
-        # Extract weights and bias
-        weights = coeffs_reshaped[:, :, :3, :]  # [B, 3, 3, H*W]
-        bias = coeffs_reshaped[:, :, 3:4, :]  # [B, 3, 1, H*W]
+        # Reshape to [B, H*W, 3, 4] for easier manipulation
+        B_affine, H_affine, W_affine, C_affine = affine.shape
+        assert B_affine == B and H_affine == H and W_affine == W, \
+            f"Affine shape mismatch: affine {affine.shape} vs input {x.shape}"
         
-        # Apply affine transform per pixel
-        # weights: [B, 3, 3, H*W], x_flat: [B, 3, H*W]
-        # We need to do batched matrix-vector multiplication
-        # For each pixel: y = W @ x + b
+        affine = affine.view(B, H * W, 3, 4)  # [B, HW, 3, 4]
         
-        # Reshape for batched matmul
-        weights = weights.permute(0, 3, 1, 2)  # [B, H*W, 3, 3]
-        x_flat_t = x_flat.permute(0, 2, 1).unsqueeze(-1)  # [B, H*W, 3, 1]
-        bias_t = bias.permute(0, 3, 1, 2)  # [B, H*W, 3, 1]
+        # Split into weights and bias
+        weights = affine[..., :3]  # [B, HW, 3, 3] - 3x3 weight matrix per pixel
+        bias = affine[..., 3]      # [B, HW, 3] - bias vector per pixel
         
-        # Batched matmul: [B, H*W, 3, 3] @ [B, H*W, 3, 1] -> [B, H*W, 3, 1]
-        y_flat = torch.bmm(weights, x_flat_t) + bias_t  # [B, H*W, 3, 1]
-        y_flat = y_flat.squeeze(-1)  # [B, H*W, 3]
+        # Flatten input image: [B, 3, H, W] -> [B, HW, 3]
+        x_flat = x.view(B, 3, H * W).permute(0, 2, 1)  # [B, HW, 3]
         
-        # Reshape back to image
+        # Apply affine transform using torch.matmul with broadcasting
+        # weights: [B, HW, 3, 3]
+        # x_flat:  [B, HW, 3]
+        # bias:    [B, HW, 3]
+        
+        # Expand x_flat to [B, HW, 3, 1] for matrix multiplication
+        x_expanded = x_flat.unsqueeze(-1)  # [B, HW, 3, 1]
+        
+        # Matrix multiplication: [B, HW, 3, 3] @ [B, HW, 3, 1] -> [B, HW, 3, 1]
+        y_expanded = torch.matmul(weights, x_expanded)  # [B, HW, 3, 1]
+        
+        # Squeeze and add bias: [B, HW, 3, 1] -> [B, HW, 3]
+        y_flat = y_expanded.squeeze(-1) + bias  # [B, HW, 3]
+        
+        # Reshape back to image: [B, HW, 3] -> [B, 3, H, W]
         y = y_flat.permute(0, 2, 1).view(B, 3, H, W)  # [B, 3, H, W]
+        
+        # Sanity check output shape
+        assert y.shape == x.shape, f"Output shape {y.shape} doesn't match input shape {x.shape}"
         
         # Clamp to valid range
         return y.clamp(0.0, 1.0)
@@ -312,14 +331,35 @@ def build_hdrnet_color_model_from_config(cfg: Dict) -> HDRNetColorModel:
 
 # Simple test function
 if __name__ == "__main__":
-    # Test that the model works
+    # Test that the model works with various batch sizes and image sizes
+    print("Testing HDRNet model...")
     model = HDRNetColorModel()
-    x = torch.rand(2, 3, 512, 512)
-    y = model(x)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {y.shape}")
-    print(f"Output range: [{y.min():.3f}, {y.max():.3f}]")
-    assert y.shape == x.shape, "Output shape should match input"
-    assert y.min() >= 0.0 and y.max() <= 1.0, "Output should be in [0, 1]"
-    print("✓ HDRNet model test passed!")
+    
+    # Test cases: (batch_size, height, width)
+    test_cases = [
+        (1, 256, 256),
+        (2, 256, 256),
+        (1, 512, 512),
+        (4, 128, 128),
+    ]
+    
+    for B, H, W in test_cases:
+        x = torch.rand(B, 3, H, W)
+        print(f"\nTest case: batch={B}, size={H}x{W}")
+        print(f"  Input shape: {x.shape}")
+        
+        try:
+            y = model(x)
+            print(f"  Output shape: {y.shape}")
+            print(f"  Output range: [{y.min():.3f}, {y.max():.3f}]")
+            
+            assert y.shape == x.shape, f"Output shape {y.shape} should match input {x.shape}"
+            assert y.min() >= 0.0 and y.max() <= 1.0, \
+                f"Output should be in [0, 1], got [{y.min():.3f}, {y.max():.3f}]"
+            print(f"  ✓ Passed")
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+            raise
+    
+    print("\n✓ All HDRNet model tests passed!")
 
