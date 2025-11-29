@@ -141,7 +141,9 @@ def train(args):
             yb = yb.to(device)
 
             opt.zero_grad()
-            yhat = model(xb)
+            residual = model(xb)  # Model returns residual only
+            yhat = xb + residual  # Add residual to input to get final output
+            yhat = torch.clamp(yhat, 0.0, 1.0)  # Clamp to valid range
 
             # L1 loss
             base_l1 = F.l1_loss(yhat, yb)
@@ -172,7 +174,9 @@ def train(args):
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                yhat = model(xb)
+                residual = model(xb)  # Model returns residual only
+                yhat = xb + residual  # Add residual to input to get final output
+                yhat = torch.clamp(yhat, 0.0, 1.0)  # Clamp to valid range
 
                 base_l1 = F.l1_loss(yhat, yb)
                 mt_l1 = midtone_weighted_l1(yhat, yb)
