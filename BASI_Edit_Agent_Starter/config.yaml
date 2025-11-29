@@ -17,6 +17,7 @@ color_model:
     num_down: 4         # encoder depth
     use_batchnorm: true
     residual: true      # model predicts residuals to add to input
+    residual_scale: 0.35   # scale factor for residual at inference (0.0-1.0, lower = more subtle)
 
 # Training configuration
 training:

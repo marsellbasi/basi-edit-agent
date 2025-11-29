@@ -148,8 +148,20 @@ def load_unet_model(model_ckpt: str, config_path: str = None):
     return model, device
 
 
-def apply_unet_transform(arr, model, device, max_side=None):
-    """Apply U-Net color transform to image array."""
+def apply_unet_transform(arr, model, device, residual_scale=0.35, max_side=None):
+    """
+    Apply U-Net color transform to image array.
+    
+    Args:
+        arr: Input image array [H, W, 3] in uint8
+        model: UNet model that predicts residual
+        device: Torch device
+        residual_scale: Scale factor for residual (0.0-1.0, lower = more subtle)
+        max_side: Optional max side for resizing
+    
+    Returns:
+        Output image array [H, W, 3] in uint8
+    """
     # Resize if max_side is specified
     h, w = arr.shape[:2]
     if max_side is not None:
@@ -165,9 +177,12 @@ def apply_unet_transform(arr, model, device, max_side=None):
     x = arr.astype(np.float32) / 255.0
     x_tensor = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device)
     
-    # Apply model
+    # Apply model to get residual
     with torch.no_grad():
-        y_tensor = model(x_tensor)
+        residual_tensor = model(x_tensor)  # [1, 3, H, W]
+    
+    # Blend: y = x + residual_scale * residual
+    y_tensor = x_tensor + residual_scale * residual_tensor
     
     # Convert back to numpy: [1, 3, H, W] -> [H, W, 3]
     y = y_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -221,11 +236,15 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Determine model type from config or checkpoint extension
-    model_type = None
+    # Load config once if provided
+    cfg = None
     if args.config:
         with open(args.config, "r") as f:
             cfg = yaml.safe_load(f)
+    
+    # Determine model type from config or checkpoint extension
+    model_type = None
+    if cfg:
         model_type = cfg.get("color_model", {}).get("type", "unet")  # Default to unet
     
     # If model_ckpt provided and no config, infer type from extension
@@ -248,6 +267,7 @@ def main():
     hdrnet_model = None
     unet_model = None
     device = None
+    residual_scale = 0.35  # Default for UNet (will be overridden from config if available)
     
     if model_type == "baseline":
         if not args.model_ckpt:
@@ -285,6 +305,14 @@ def main():
         
         print(f"Loading UNet model from: {args.model_ckpt}")
         unet_model, device = load_unet_model(args.model_ckpt, args.config)
+        
+        # Read residual_scale from config for UNet (allows tuning strength at inference)
+        # Lower values (e.g., 0.35) produce more subtle effects
+        # Tune this via color_model.unet.residual_scale in config.yaml
+        if cfg:
+            unet_cfg = cfg.get("color_model", {}).get("unet", {})
+            residual_scale = float(unet_cfg.get("residual_scale", 0.35))
+        print(f"Using residual_scale: {residual_scale} (tune via color_model.unet.residual_scale in config.yaml)")
     
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -300,7 +328,7 @@ def main():
             elif model_type == "hdrnet":
                 y = apply_hdrnet_transform(arr, hdrnet_model, device, max_side=args.max_side)
             elif model_type == "unet":
-                y = apply_unet_transform(arr, unet_model, device, max_side=args.max_side)
+                y = apply_unet_transform(arr, unet_model, device, residual_scale=residual_scale, max_side=args.max_side)
             else:
                 raise ValueError(f"Unknown model type: {model_type}")
 

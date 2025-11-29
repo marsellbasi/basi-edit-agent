@@ -117,7 +117,9 @@ class UNetColorModel(nn.Module):
             x: Input image [B, 3, H, W] in [0, 1]
         
         Returns:
-            Output image [B, 3, H, W] in [0, 1]
+            Residual [B, 3, H, W] that should be added to input.
+            The residual is typically in range roughly [-1, 1] and will be
+            scaled by the caller (e.g., via residual_scale in config).
         """
         # Encoder with skip connections
         skip_connections = []
@@ -155,20 +157,15 @@ class UNetColorModel(nn.Module):
             double_conv = self.decoder[i + 1]
             decoder_out = double_conv(decoder_out)
         
-        # Final output
+        # Final output: predict residual only
         residual = self.final_conv(decoder_out)
         
         # Handle size mismatch with input
         if residual.shape[2:] != x.shape[2:]:
             residual = F.interpolate(residual, size=x.shape[2:], mode='bilinear', align_corners=False)
         
-        # Add residual to input
-        if self.residual:
-            y = x + residual
-        else:
-            y = residual
-        
-        return torch.clamp(y, 0.0, 1.0)
+        # Return residual only (caller will add it to input with optional scaling)
+        return residual
 
 
 def build_unet_color_model_from_config(cfg: Dict[str, Any]) -> nn.Module:
@@ -203,10 +200,15 @@ if __name__ == "__main__":
     # Test that the model works
     model = UNetColorModel()
     x = torch.rand(2, 3, 256, 256)
-    y = model(x)
+    residual = model(x)  # Model returns residual
+    y = x + residual  # Add residual to get final output
+    y = torch.clamp(y, 0.0, 1.0)
     print(f"Input shape: {x.shape}")
+    print(f"Residual shape: {residual.shape}")
     print(f"Output shape: {y.shape}")
+    print(f"Residual range: [{residual.min():.3f}, {residual.max():.3f}]")
     print(f"Output range: [{y.min():.3f}, {y.max():.3f}]")
+    assert residual.shape == x.shape, "Residual shape should match input"
     assert y.shape == x.shape, "Output shape should match input"
     assert y.min() >= 0.0 and y.max() <= 1.0, "Output should be in [0, 1]"
     print("✓ U-Net model test passed!")
