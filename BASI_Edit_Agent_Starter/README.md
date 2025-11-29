@@ -135,6 +135,123 @@ python make_triplet_previews.py \
 
 ---
 
+## Stage 1 – HDRNet Color Model (BASI Color v1)
+
+The HDRNet-based color model is an advanced alternative to the baseline global color model. It uses a bilateral grid architecture to predict local affine color transforms, enabling both global and local color/tone adjustments while preserving edges.
+
+### What is HDRNet?
+
+HDRNet (Deep Bilateral Learning for Real-Time Image Enhancement) uses:
+- A **low-resolution encoder** that processes a downsampled input
+- A **bilateral grid** of affine coefficients predicted from the low-res features
+- **Bilateral slicing** that maps coefficients to full resolution using a luminance guide
+- **Local affine color transforms** applied per-pixel to the full-resolution image
+
+This architecture allows the model to learn spatially-varying color adjustments while maintaining edge-preserving properties.
+
+### Training the HDRNet Color Model
+
+```bash
+cd BASI_Edit_Agent_Starter
+python train_hdrnet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20 \
+  --max_side 640
+```
+
+**Command-line options:**
+- `--config`: Path to YAML config file (required)
+- `--dataset_version`: Dataset version (e.g., `dataset_v1`)
+- `--epochs`: Number of training epochs (overrides config if provided)
+- `--max_side`: Maximum side length for image resizing (default: 640)
+- `--batch_size`: Batch size (overrides config if provided)
+- `--resume_from`: Path to checkpoint to resume from
+- `--resume`: Resume from latest checkpoint if it exists
+
+**Checkpoints:**
+- Saved to `checkpoints/hdrnet_color/epoch_{:03d}.pt`
+- Latest checkpoint: `checkpoints/hdrnet_color/latest.pt`
+- Each checkpoint includes model state, optimizer state, epoch number, and config
+
+**Resuming training:**
+```bash
+# Resume from latest checkpoint
+python train_hdrnet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20 \
+  --resume
+
+# Resume from specific checkpoint
+python train_hdrnet_color.py \
+  --config config.yaml \
+  --dataset_version dataset_v1 \
+  --epochs 20 \
+  --resume_from checkpoints/hdrnet_color/epoch_010.pt
+```
+
+### Running Inference with HDRNet
+
+**Using config file (recommended):**
+1. Set `color_model.type: "hdrnet"` in `config.yaml`
+2. Run inference:
+```bash
+python apply_color_model.py \
+  --config config.yaml \
+  --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --output_dir "BASI_EDIT_AGENT/stage1_hdrnet/val_e20" \
+  --model_ckpt "checkpoints/hdrnet_color/latest.pt"
+```
+
+**Direct checkpoint path:**
+```bash
+python apply_color_model.py \
+  --input_glob "BASI_EDIT_AGENT/bg_v1/val/before/*.jpg" \
+  --output_dir "BASI_EDIT_AGENT/stage1_hdrnet/val_e20" \
+  --model_ckpt "checkpoints/hdrnet_color/epoch_020.pt" \
+  --config config.yaml
+```
+
+The script automatically detects HDRNet models by the `.pt` extension and uses the appropriate inference path.
+
+### Configuration
+
+HDRNet model parameters are configured in `config.yaml`:
+
+```yaml
+color_model:
+  type: "hdrnet"  # or "baseline" for the original model
+  hdrnet:
+    bilateral_grid_size: [16, 16, 8]  # [H_grid, W_grid, D_grid]
+    lowres_channels: 16
+    hidden_dim: 64
+    num_affine_params: 12  # 3 channels * 4 params (3 weights + 1 bias)
+    input_downsample: 256  # Target side length for low-res processing
+
+training:
+  hdrnet_color:
+    batch_size: 1
+    num_workers: 0
+    lr: 1.0e-4
+    weight_decay: 0.0
+    epochs: 20
+    save_every: 1
+    loss:
+      l1_weight: 1.0
+      ssim_weight: 0.0
+```
+
+### Switching Between Models
+
+To switch between baseline and HDRNet models, simply change `color_model.type` in `config.yaml`:
+- `"baseline"`: Uses the original global color model (JSON checkpoint)
+- `"hdrnet"`: Uses the HDRNet model (PyTorch checkpoint)
+
+The `apply_color_model.py` script automatically selects the correct model type based on the config or checkpoint file extension.
+
+---
+
 ## Stage 2 – Background Residual Model
 
 ### Training Stage 2 background model

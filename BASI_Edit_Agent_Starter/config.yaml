@@ -2,3 +2,26 @@ dataset_root: ./BASI_EDIT_AGENT
 output_root: ./BASI_EDIT_AGENT
 random_seed: 42
 
+# Color model configuration
+color_model:
+  type: "baseline"  # options: "baseline", "hdrnet"
+  hdrnet:
+    bilateral_grid_size: [16, 16, 8]
+    lowres_channels: 16
+    hidden_dim: 64
+    num_affine_params: 12
+    input_downsample: 256
+
+# Training configuration
+training:
+  hdrnet_color:
+    batch_size: 1
+    num_workers: 0
+    lr: 1.0e-4
+    weight_decay: 0.0
+    epochs: 20
+    save_every: 1
+    loss:
+      l1_weight: 1.0
+      ssim_weight: 0.0  # SSIM loss not implemented yet
+

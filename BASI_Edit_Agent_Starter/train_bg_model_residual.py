@@ -16,76 +16,82 @@ from tqdm import tqdm
 
 # ...
 
-def collate_pairs(batch):
-    """
-    batch: list of (before_tensor, after_tensor)
-    returns:
-      xb: (B, 3, H, W)
-      yb: (B, 3, H, W)
-    """
-    befores, afters = zip(*batch)  # unzip list of tuples
-    xb = torch.stack(befores, dim=0)
-    yb = torch.stack(afters, dim=0)
-    return xb, yb
-
-
 # -----------------------------
 # Dataset
 # -----------------------------
 
 class BgDataset(Dataset):
-    """
-    Background cleanup dataset.
-
-    before_glob: pattern for 'before' images
-    after_glob:  pattern for 'after' images
-    """
-
-    def __init__(self, before_glob, after_glob, max_side=1024, train=True):
-        self.max_side = max_side
-        self.train = train
-
-        # Grab file lists
+    def __init__(self, before_glob, after_glob, max_side=640, is_train=True):
         self.before_paths = sorted(glob.glob(before_glob))
         self.after_paths = sorted(glob.glob(after_glob))
 
-        if not self.before_paths:
-            raise ValueError(f"No 'before' files found for pattern: {before_glob}")
-        if not self.after_paths:
-            raise ValueError(f"No 'after' files found for pattern: {after_glob}")
+        assert len(self.before_paths) == len(self.after_paths), \
+            f"len(before)={len(self.before_paths)} len(after)={len(self.after_paths)} mismatch"
 
-        # Pair by index after sorting
-        n = min(len(self.before_paths), len(self.after_paths))
-        if n == 0:
-            raise ValueError("No overlapping before/after files (n=0).")
-
-        if len(self.before_paths) != len(self.after_paths):
-            print(
-                f"[BgDataset] WARNING: len(before)={len(self.before_paths)} "
-                f"len(after)={len(self.after_paths)} -> trimming to {n}"
-            )
-            self.before_paths = self.before_paths[:n]
-            self.after_paths = self.after_paths[:n]
+        self.max_side = max_side
+        self.is_train = is_train
 
     def __len__(self):
         return len(self.before_paths)
 
-    def _load_and_preprocess(self, path):
-        img = Image.open(path).convert("RGB")
+    def _load_mask(self, before_path: str):
+        """
+        Load a subject mask PNG if it exists.
+        We expect something like:
+
+        before: BASI_EDIT_AGENT/bg_v1/train/before/abc.jpg
+        mask:   BASI_EDIT_AGENT/bg_v1/train/masks/abc.png
+        """
+        mask_path = before_path.replace("/before/", "/masks/")
+        mask_path = os.path.splitext(mask_path)[0] + ".png"
+        if os.path.exists(mask_path):
+            m = Image.open(mask_path).convert("L")  # grayscale
+            return m
+        return None
+
+    def _resize(self, img: Image.Image, max_side: int):
         w, h = img.size
-
-        # Simple max-side resize
-        scale = min(self.max_side / max(w, h), 1.0)
+        scale = min(max_side / max(w, h), 1.0)
         if scale < 1.0:
-            new_size = (int(round(w * scale)), int(round(h * scale)))
-            img = img.resize(new_size, Image.BICUBIC)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = img.resize((new_w, new_h), Image.BILINEAR)
+        return img
 
-        return T.ToTensor()(img)
+    def _to_tensor(self, img: Image.Image):
+        import torchvision.transforms as T
+        tfm = T.ToTensor()  # [0,1], CxHxW
+        return tfm(img)
 
     def __getitem__(self, idx):
-        xb = self._load_and_preprocess(self.before_paths[idx])
-        yb = self._load_and_preprocess(self.after_paths[idx])
-        return xb, yb
+        before_path = self.before_paths[idx]
+        after_path = self.after_paths[idx]
+
+        x_img = Image.open(before_path).convert("RGB")
+        y_img = Image.open(after_path).convert("RGB")
+        m_img = self._load_mask(before_path)
+
+        # Basic resize to max_side for all
+        x_img = self._resize(x_img, self.max_side)
+        y_img = self._resize(y_img, self.max_side)
+        if m_img is not None:
+            m_img = m_img.resize(x_img.size, Image.NEAREST)
+
+        # TODO: if you already have more advanced data augmentation in this file
+        # (random crops, flips, etc.), make sure to apply the SAME ops to x_img,
+        # y_img, and m_img here. For now we keep it simple and only resize.
+
+        x = self._to_tensor(x_img)  # [3,H,W]
+        y = self._to_tensor(y_img)  # [3,H,W]
+
+        if m_img is not None:
+            import numpy as np
+            m_np = (np.array(m_img) > 0).astype("float32")  # [H,W], 0 or 1
+            m = torch.from_numpy(m_np)  # [H,W]
+        else:
+            m = None
+
+        return x, y, m
 
 # -----------------------------
 # Small UNet-like residual model
@@ -273,13 +279,13 @@ def train(args):
         before_glob=args.train_before_glob,
         after_glob=args.train_after_glob,
         max_side=args.max_side,
-        train=True,
+        is_train=True,
     )
     val_ds = BgDataset(
         before_glob=args.val_before_glob,
         after_glob=args.val_after_glob,
         max_side=args.max_side,
-        train=False,
+        is_train=False,
     )
 
     # Debug: how many pairs we actually have
@@ -297,17 +303,21 @@ def train(args):
         left = max(0, (w - target_w) // 2)
         return img[:, top:top + target_h, left:left + target_w]
 
-    # custom collate: stack befores and afters into tensors
+    # custom collate: stack befores, afters, and masks into tensors
     def collate_fn(batch):
         """
-        batch: list of (before_tensor, after_tensor)
+        batch: list of (before_tensor, after_tensor, mask_tensor or None)
         returns:
           xb: (B, 3, H, W)
           yb: (B, 3, H, W)
+          mb: (B, H, W) or None
         We center-crop all images in the batch to the same (min_h, min_w)
         so torch.stack() will not fail on tiny mismatches like 426 vs 427.
         """
-        befores, afters = zip(*batch)  # unzip
+        items = list(zip(*batch))  # unzip: (befores, afters, masks)
+        befores = items[0]
+        afters = items[1]
+        masks = items[2] if len(items) > 2 else [None] * len(befores)
 
         # Compute global minimum H and W across both before and after tensors
         all_h = [b.shape[1] for b in befores] + [a.shape[1] for a in afters]
@@ -324,7 +334,23 @@ def train(args):
 
         xb = torch.stack(cropped_befores, dim=0)
         yb = torch.stack(cropped_afters, dim=0)
-        return xb, yb
+
+        # Handle masks: crop and stack if they exist
+        mb_list = []
+        has_masks = any(m is not None for m in masks)
+        if has_masks:
+            for m in masks:
+                if m is not None:
+                    m_cropped = _center_crop(m.unsqueeze(0).contiguous(), target_h, target_w).squeeze(0)
+                    mb_list.append(m_cropped)
+                else:
+                    # Create a dummy mask (all ones) if missing
+                    mb_list.append(torch.ones(target_h, target_w, dtype=torch.float32))
+            mb = torch.stack(mb_list, dim=0)
+        else:
+            mb = None
+
+        return xb, yb, mb
 
     # ----- dataloaders -----
     train_loader = DataLoader(
@@ -379,6 +405,16 @@ def train(args):
 
     identity_weight = args.identity_weight
 
+    def masked_l1(pred, target, mask):
+        """
+        pred, target: [B,3,H,W]
+        mask: [B,1,H,W] with 0/1
+        """
+        diff = torch.abs(pred - target) * mask
+        # avoid division by zero
+        denom = mask.sum() * pred.shape[1] + 1e-8
+        return diff.sum() / denom
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_total = 0.0
@@ -386,9 +422,18 @@ def train(args):
         running_identity = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]")
-        for xb, yb in pbar:
+        for xb, yb, mb in pbar:
             xb = xb.to(device)
             yb = yb.to(device)
+
+            if mb is not None:
+                mb = mb.to(device).unsqueeze(1)  # [B,1,H,W]
+                subject_mask = mb
+                bg_mask = 1.0 - mb
+            else:
+                # Fallback: no masks → treat whole image as both subject & bg
+                subject_mask = torch.ones_like(xb[:, :1, :, :])
+                bg_mask = torch.ones_like(xb[:, :1, :, :])
 
             optimizer.zero_grad()
 
@@ -397,8 +442,12 @@ def train(args):
             residual = torch.tanh(residual) * 0.3
             pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-            loss_bg = F.l1_loss(pred, yb)
-            loss_identity = F.l1_loss(pred, xb)
+            # Background should match the edited AFTER image
+            loss_bg = masked_l1(pred, yb, bg_mask)
+
+            # Subject should stay close to the original BEFORE image
+            loss_identity = masked_l1(pred, xb, subject_mask)
+
             loss = loss_bg + identity_weight * loss_identity
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -420,15 +469,21 @@ def train(args):
         model.eval()
         val_running = 0.0
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for xb, yb, mb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
+
+                if mb is not None:
+                    mb = mb.to(device).unsqueeze(1)  # [B,1,H,W]
+                    bg_mask = 1.0 - mb
+                else:
+                    bg_mask = torch.ones_like(xb[:, :1, :, :])
 
                 residual = model(xb)
                 residual = torch.tanh(residual) * 0.3
                 pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-                loss = F.l1_loss(pred, yb)
+                loss = masked_l1(pred, yb, bg_mask)
                 val_running += loss.item() * xb.size(0)
 
         val_l1 = val_running / len(val_ds)

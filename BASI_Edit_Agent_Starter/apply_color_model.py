@@ -7,12 +7,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+import torch
+import yaml
 
 IMG_OK = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
-def load_model(model_ckpt: str):
-    """Load color model from JSON checkpoint."""
+def load_baseline_model(model_ckpt: str):
+    """Load baseline color model from JSON checkpoint."""
     with open(model_ckpt, "r") as f:
         ckpt = json.load(f)
     M = np.array(ckpt["M"], dtype=np.float32)
@@ -26,8 +28,40 @@ def load_model(model_ckpt: str):
     return M, b, curves
 
 
-def apply_transform(arr, M, b, curves, max_side=None):
-    """Apply color transform to image array."""
+def load_hdrnet_model(model_ckpt: str, config_path: str = None):
+    """Load HDRNet color model from PyTorch checkpoint."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load config if provided
+    if config_path:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        hdrnet_cfg = cfg.get("color_model", {}).get("hdrnet", {})
+    else:
+        # Try to load config from checkpoint
+        hdrnet_cfg = {}
+    
+    # Import HDRNet model
+    from models.hdrnet_color_model import build_hdrnet_color_model_from_config
+    
+    # Load checkpoint
+    ckpt = torch.load(model_ckpt, map_location=device)
+    
+    # Get config from checkpoint if available
+    if "config" in ckpt:
+        hdrnet_cfg = ckpt["config"]
+    
+    # Build model
+    model = build_hdrnet_color_model_from_config(hdrnet_cfg)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    
+    return model, device
+
+
+def apply_baseline_transform(arr, M, b, curves, max_side=None):
+    """Apply baseline color transform to image array."""
     # Resize if max_side is specified
     h, w = arr.shape[:2]
     if max_side is not None:
@@ -55,6 +89,34 @@ def apply_transform(arr, M, b, curves, max_side=None):
     return out
 
 
+def apply_hdrnet_transform(arr, model, device, max_side=None):
+    """Apply HDRNet color transform to image array."""
+    # Resize if max_side is specified
+    h, w = arr.shape[:2]
+    if max_side is not None:
+        scale = min(1.0, max_side / max(h, w))
+        if scale < 1.0:
+            img = Image.fromarray(arr)
+            new_size = (int(round(w * scale)), int(round(h * scale)))
+            img = img.resize(new_size, Image.LANCZOS)
+            arr = np.array(img)
+            h, w = arr.shape[:2]
+
+    # Convert to tensor: [H, W, 3] -> [1, 3, H, W]
+    x = arr.astype(np.float32) / 255.0
+    x_tensor = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device)
+    
+    # Apply model
+    with torch.no_grad():
+        y_tensor = model(x_tensor)
+    
+    # Convert back to numpy: [1, 3, H, W] -> [H, W, 3]
+    y = y_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    y = np.clip(y, 0, 1)
+    out = (y * 255.0 + 0.5).astype(np.uint8)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Apply Stage 1 global color model to images."
@@ -73,9 +135,15 @@ def main():
     )
     parser.add_argument(
         "--model_ckpt",
-        required=True,
         type=str,
-        help="Path to color model JSON checkpoint (e.g., checkpoints/color_v1_e20/color_model.json or BASI_ARCHIVE/models/color_v0/color_model.json)",
+        default=None,
+        help="Path to color model checkpoint (JSON for baseline, .pt for HDRNet). If not provided, uses config.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML config file (required if using HDRNet or if model_ckpt not provided)",
     )
     parser.add_argument(
         "--max_side",
@@ -94,15 +162,64 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Loading color model from: {args.model_ckpt}")
-    M, b, curves = load_model(args.model_ckpt)
+    # Determine model type from config or checkpoint extension
+    model_type = None
+    if args.config:
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        model_type = cfg.get("color_model", {}).get("type", "baseline")
+    
+    # If model_ckpt provided, infer type from extension
+    if args.model_ckpt:
+        if args.model_ckpt.endswith(".pt") or args.model_ckpt.endswith(".pth"):
+            model_type = "hdrnet"
+        elif args.model_ckpt.endswith(".json"):
+            model_type = "baseline"
+    
+    # Default to baseline if not determined
+    if model_type is None:
+        model_type = "baseline"
+    
+    print(f"Using model type: {model_type}")
+    
+    # Load model
+    if model_type == "hdrnet":
+        if not args.model_ckpt:
+            # Try to find default HDRNet checkpoint
+            default_ckpt = "checkpoints/hdrnet_color/latest.pt"
+            if os.path.exists(default_ckpt):
+                args.model_ckpt = default_ckpt
+            else:
+                raise ValueError("HDRNet model requires --model_ckpt or config must specify checkpoint path")
+        
+        print(f"Loading HDRNet model from: {args.model_ckpt}")
+        hdrnet_model, device = load_hdrnet_model(args.model_ckpt, args.config)
+        baseline_model = None
+    else:
+        if not args.model_ckpt:
+            # Try to find default baseline checkpoint
+            default_ckpt = "BASI_ARCHIVE/models/color_v0/color_model.json"
+            if os.path.exists(default_ckpt):
+                args.model_ckpt = default_ckpt
+            else:
+                raise ValueError("Baseline model requires --model_ckpt or config must specify checkpoint path")
+        
+        print(f"Loading baseline model from: {args.model_ckpt}")
+        M, b, curves = load_baseline_model(args.model_ckpt)
+        baseline_model = (M, b, curves)
+        hdrnet_model = None
+        device = None
 
     processed = 0
     for src in tqdm(files, desc="Applying color model"):
         try:
             img = Image.open(src).convert("RGB")
             arr = np.array(img)
-            y = apply_transform(arr, M, b, curves, max_side=args.max_side)
+            
+            if model_type == "hdrnet":
+                y = apply_hdrnet_transform(arr, hdrnet_model, device, max_side=args.max_side)
+            else:
+                y = apply_baseline_transform(arr, baseline_model[0], baseline_model[1], baseline_model[2], max_side=args.max_side)
 
             # Save with same basename
             fname = src.name
