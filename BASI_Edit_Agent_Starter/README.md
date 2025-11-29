@@ -6,6 +6,26 @@ This kit gives you:
 3) **Apply Script** — applies the trained transform to full‑res images.
 4) **Watch Agent** — a simple watch‑folder runner (drop files → get outputs).
 
+## BASI Color v1 (UNet) – Quickstart
+
+Once you have trained or downloaded the UNet color checkpoints into
+`BASI_Edit_Agent_Starter/checkpoints/unet_color/` (with `latest.pt` present),
+you can run BASI Color v1 on a folder of images with:
+
+```bash
+cd /workspace/code/basi-edit-agent
+chmod +x run_basi_color_v1.sh  # one-time
+./run_basi_color_v1.sh "/workspace/path/to/input/*.jpg" "outputs_basi_color_v1"
+```
+
+If you omit arguments, the script defaults to:
+
+- Input glob: `test_inputs_unet/*.jpg`
+- Output dir: `outputs_basi_color_v1`
+
+The script uses `config.yaml` and the UNet checkpoint at
+`BASI_Edit_Agent_Starter/checkpoints/unet_color/latest.pt`.
+
 ## 0) Create the conda environment
 ```bash
 conda env create -f environment.yml
