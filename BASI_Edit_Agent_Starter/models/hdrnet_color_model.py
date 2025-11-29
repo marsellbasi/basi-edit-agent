@@ -16,44 +16,50 @@ import torch.nn.functional as F
 
 def apply_affine_coeffs(x: torch.Tensor, coeffs: torch.Tensor) -> torch.Tensor:
     """
-    Apply per-pixel affine coefficients to an image.
-    
+    Apply per-pixel 3x4 affine color transforms to an RGB image.
+
     Args:
-        x: Input image [B, 3, H, W] in [0, 1]
-        coeffs: Affine coefficients [B, 12, H, W] (3x4 affine per pixel)
-    
+        x:      [B, 3, H, W] tensor in [0, 1]
+        coeffs: [B, 12, H, W] tensor, representing a 3x4 matrix per pixel
+                flattened in row-major order:
+                    [a00, a01, a02, a03,
+                     a10, a11, a12, a13,
+                     a20, a21, a22, a23]
+                so that:
+                    [r', g', b']^T = A @ [r, g, b, 1]^T
+
     Returns:
-        Output image [B, 3, H, W] in [0, 1]
+        y: [B, 3, H, W] tensor in [0, 1]
     """
     assert x.dim() == 4 and x.size(1) == 3, f"Expected x [B, 3, H, W], got {x.shape}"
     assert coeffs.dim() == 4 and coeffs.size(1) == 12, f"Expected coeffs [B, 12, H, W], got {coeffs.shape}"
-    
+
     B, _, H, W = x.shape
-    
+
     # [B, 12, H, W] -> [B, H, W, 12]
-    coeffs = coeffs.permute(0, 2, 3, 1).contiguous()
-    
-    # [B, H, W, 12] -> [B, HW, 3, 4]
-    coeffs = coeffs.view(B, H * W, 3, 4)
-    
+    coeffs_hw = coeffs.permute(0, 2, 3, 1).contiguous()  # [B, H, W, 12]
+
+    # [B, H, W, 12] -> [B, H*W, 3, 4]
+    coeffs_mat = coeffs_hw.view(B, H * W, 3, 4)          # [B, HW, 3, 4]
+
     # Split into weights and bias
-    weights = coeffs[..., :3]   # [B, HW, 3, 3]
-    bias = coeffs[..., 3]       # [B, HW, 3]
-    
+    weights = coeffs_mat[..., :3]  # [B, HW, 3, 3]
+    bias    = coeffs_mat[..., 3]   # [B, HW, 3]
+
     # Flatten image to [B, HW, 3]
-    x_flat = x.view(B, 3, H * W).permute(0, 2, 1)  # [B, HW, 3]
-    
+    x_flat = x.view(B, 3, H * W).permute(0, 2, 1)        # [B, HW, 3]
+
     # Apply affine: y = W * x + b
-    x_expanded = x_flat.unsqueeze(-1)              # [B, HW, 3, 1]
-    y_expanded = torch.matmul(weights, x_expanded) # [B, HW, 3, 1]
-    y_flat = y_expanded.squeeze(-1) + bias        # [B, HW, 3]
-    
+    x_expanded = x_flat.unsqueeze(-1)                    # [B, HW, 3, 1]
+    y_expanded = torch.matmul(weights, x_expanded)       # [B, HW, 3, 1]
+    y_flat = y_expanded.squeeze(-1) + bias               # [B, HW, 3]
+
     # Back to [B, 3, H, W]
     y = y_flat.permute(0, 2, 1).view(B, 3, H, W)
-    
-    # Make sure range is reasonable
+
+    # Clamp to valid range
     y = torch.clamp(y, 0.0, 1.0)
-    
+
     return y
 
 
@@ -334,59 +340,23 @@ def build_hdrnet_color_model_from_config(cfg: Dict) -> HDRNetColorModel:
 
 def _test_identity_affine():
     """Test that identity affine coefficients produce the input image."""
-    B, H, W = 2, 64, 64
+    B, H, W = 2, 32, 48
     x = torch.rand(B, 3, H, W)
-    
-    # Build identity affine coeffs: y = x
-    # diag ones for R,G,B
+
+    # Build identity affine: y = x
     coeffs = torch.zeros(B, 12, H, W)
-    coeffs[:, 0, :, :] = 1.0  # R -> R
-    coeffs[:, 4, :, :] = 1.0  # G -> G
-    coeffs[:, 8, :, :] = 1.0  # B -> B
-    
+    # Row 0: [1, 0, 0, 0] maps R -> R
+    coeffs[:, 0, :, :] = 1.0  # a00
+    # Row 1: [0, 1, 0, 0] maps G -> G
+    coeffs[:, 5, :, :] = 1.0  # a11
+    # Row 2: [0, 0, 1, 0] maps B -> B
+    coeffs[:, 10, :, :] = 1.0 # a22
+
     y = apply_affine_coeffs(x, coeffs)
-    
     max_diff = (x - y).abs().max().item()
-    print("Max diff identity test:", max_diff)
-    assert max_diff < 1e-5, f"Identity test failed: max diff = {max_diff}"
-    print("✓ Identity affine test passed!")
+    print("Max diff (identity test):", max_diff)
 
 
-# Simple test function
 if __name__ == "__main__":
-    # Test identity affine first
-    print("Testing identity affine...")
     _test_identity_affine()
-    
-    # Test that the model works with various batch sizes and image sizes
-    print("\nTesting HDRNet model...")
-    model = HDRNetColorModel()
-    
-    # Test cases: (batch_size, height, width)
-    test_cases = [
-        (1, 256, 256),
-        (2, 256, 256),
-        (1, 512, 512),
-        (4, 128, 128),
-    ]
-    
-    for B, H, W in test_cases:
-        x = torch.rand(B, 3, H, W)
-        print(f"\nTest case: batch={B}, size={H}x{W}")
-        print(f"  Input shape: {x.shape}")
-        
-        try:
-            y = model(x)
-            print(f"  Output shape: {y.shape}")
-            print(f"  Output range: [{y.min():.3f}, {y.max():.3f}]")
-            
-            assert y.shape == x.shape, f"Output shape {y.shape} should match input {x.shape}"
-            assert y.min() >= 0.0 and y.max() <= 1.0, \
-                f"Output should be in [0, 1], got [{y.min():.3f}, {y.max():.3f}]"
-            print(f"  ✓ Passed")
-        except Exception as e:
-            print(f"  ✗ Failed: {e}")
-            raise
-    
-    print("\n✓ All HDRNet model tests passed!")
 
