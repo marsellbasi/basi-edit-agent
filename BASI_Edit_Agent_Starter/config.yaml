@@ -4,20 +4,19 @@ random_seed: 42
 
 # Color model configuration
 color_model:
-  type: "unet"  # options: "baseline", "hdrnet", "unet"
-  baseline: {}  # Baseline model uses default parameters
+  # which model to use at inference
+  type: "unet"
   hdrnet:
-    bilateral_grid_size: [16, 16, 8]
-    lowres_channels: 16
-    hidden_dim: 64
-    num_affine_params: 12
-    input_downsample: 256
+    ckpt_path: "checkpoints/hdrnet_color/latest.pt"
+    residual_scale: 0.30
   unet:
+    input_downsample: 256
+    # UNet architecture
     base_channels: 32
-    num_down: 4         # encoder depth
+    num_down: 4
     use_batchnorm: true
-    residual: true      # model predicts residuals to add to input
-    residual_scale: 0.30   # scale factor for residual at inference (0.0-1.0, lower = more subtle)
+    residual: true
+    residual_scale: 0.30  # scale factor at inference (0.0–1.0)
 
 # Training configuration
 training:
