@@ -457,4 +457,93 @@ It will:
 
 ---
 
+## Stage 3 – Skin Residual Model
+
+The Stage 3 skin residual model performs gentle skin/face retouching as a residual pass after color and background adjustments. It uses the same UNet-style residual architecture as Stage 2, but is trained specifically on skin retouching datasets.
+
+### Dataset Structure
+
+The skin model expects a dataset with the following structure:
+
+```
+BASI_EDIT_AGENT/skin_v1/
+  train/
+    before/*.jpg  # Original images
+    after/*.jpg   # Retouched images
+  val/
+    before/*.jpg
+    after/*.jpg
+```
+
+The dataset paths are configured in `config.yaml` under the `datasets.skin_v1` section.
+
+### Training Stage 3 skin model
+
+```bash
+cd BASI_Edit_Agent_Starter
+python train_skin_model.py \
+  --config config.yaml \
+  --dataset_version skin_v1 \
+  --epochs 20 \
+  --batch_size 4 \
+  --max_side 1024
+```
+
+**Command-line options:**
+- `--config`: Path to YAML config file (default: config.yaml)
+- `--dataset_version`: Dataset version (e.g., `skin_v1`)
+- `--epochs`: Number of training epochs (overrides config if provided)
+- `--batch_size`: Batch size (overrides config if provided)
+- `--max_side`: Maximum side length for image resizing (overrides config if provided)
+- `--lr`: Learning rate (overrides config if provided)
+- `--identity_weight`: Weight for identity loss regularization (overrides config if provided)
+- `--model_dir`: Model checkpoint directory (overrides config if provided)
+- `--resume`: Resume from latest checkpoint if it exists
+- `--resume_ckpt`: Path to specific checkpoint to resume from
+
+**Checkpoints:**
+- Saved to `checkpoints/skin_residual/epoch_{:03d}.pt`
+- Latest checkpoint: `checkpoints/skin_residual/latest.pt`
+- Best checkpoint: `checkpoints/skin_residual/best.pt`
+
+**Training objective:**
+- Main loss: L1 between predicted image and target after image
+- Identity loss: L1 between predicted image and input before image (regularization to prevent over-smoothing)
+- Total loss: `loss_l1 + identity_weight * loss_identity`
+
+### Applying Stage 3 to images
+
+```bash
+python apply_skin_model.py \
+  --input_glob "BASI_EDIT_AGENT/skin_v1/val/before/*.jpg" \
+  --output_dir "outputs/skin_retouched" \
+  --model_ckpt "checkpoints/skin_residual/best.pt" \
+  --residual_scale 0.5
+```
+
+**Command-line options:**
+- `--input_glob`: Glob pattern for input images (required)
+- `--output_dir`: Directory to save processed images (required)
+- `--config`: Path to YAML config file (default: config.yaml)
+- `--model_ckpt`: Path to checkpoint file (default: uses config to find best.pt)
+- `--residual_scale`: Scale factor for residual blending (default: 0.5)
+- `--device`: Device to use (cuda or cpu, auto-detects if not provided)
+
+The `residual_scale` parameter controls the strength of the retouching effect:
+- `0.0`: No effect (original image)
+- `0.5`: Moderate retouching (default)
+- `1.0`: Full model effect
+
+### Pipeline Integration
+
+Stage 3 is designed to be applied after Stage 1 (color) and Stage 2 (background):
+
+1. **Stage 1**: Global color/tone adjustment
+2. **Stage 2**: Background-specific edits (with subject masks)
+3. **Stage 3**: Skin/face retouching (gentle residual pass)
+
+Each stage can be applied independently or in sequence for a complete editing pipeline.
+
+---
+
 If you get stuck, open the CSV report and check unmatched rows.

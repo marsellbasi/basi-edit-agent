@@ -53,6 +53,37 @@ training:
     max_side: 1024
     identity_weight: 0.1
     use_mask: false
+    # bg_model_version: "v1" (original) or "v2" (stronger background edits with mask-weighted residuals)
+    # v2 produces more visible background changes by:
+    #   - Using larger model capacity (base_ch=48 vs 32)
+    #   - Applying mask-weighted residuals (full strength on bg, suppressed on subject)
+    #   - Allowing stronger residual scaling (0.6 vs 0.3)
+    bg_model_version: "v1"  # Set to "v2" for stronger background edits
+    # v2-specific settings (only used when bg_model_version="v2"):
+    bg_residual_scale: 1.0    # Residual scale for background regions (v2 only, default 1.0 = full strength)
+    subj_residual_scale: 0.1  # Residual scale for subject regions (v2 only, default 0.1 = strongly suppressed)
+    base_ch: 48               # Base channels for v2 (default 48 vs 32 for v1, increases model capacity)
     loss:
       l1_weight: 1.0
+  skin_residual:
+    lr: 1e-4
+    weight_decay: 0.0
+    batch_size: 4
+    num_workers: 0
+    epochs: 20
+    save_every: 1
+    model_dir: "checkpoints/skin_residual"
+    dataset_version: "skin_v1"
+    max_side: 1024
+    identity_weight: 0.3
+    loss:
+      l1_weight: 1.0
+
+# Dataset configurations
+datasets:
+  skin_v1:
+    train_before_glob: "BASI_EDIT_AGENT/skin_v1/train/before/*.jpg"
+    train_after_glob: "BASI_EDIT_AGENT/skin_v1/train/after/*.jpg"
+    val_before_glob: "BASI_EDIT_AGENT/skin_v1/val/before/*.jpg"
+    val_after_glob: "BASI_EDIT_AGENT/skin_v1/val/after/*.jpg"
 

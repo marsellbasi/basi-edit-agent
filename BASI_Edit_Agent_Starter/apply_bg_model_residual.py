@@ -9,14 +9,39 @@ from PIL import Image
 from torchvision import transforms as T
 from tqdm import tqdm
 
-from train_bg_model_residual import BgResidualNet
+from models.residual_unet import BgResidualNet, BgResidualNetV2
 
 IMG_OK = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
-def load_model(model_ckpt: str, device: torch.device, use_mask: bool = False) -> torch.nn.Module:
-    """Load BgResidualNet from checkpoint."""
-    model = BgResidualNet(in_ch=3, base_ch=32, use_mask=use_mask).to(device)
+def load_model(model_ckpt: str, device: torch.device, use_mask: bool = False, 
+               bg_model_version: str = "v1") -> torch.nn.Module:
+    """
+    Load BgResidualNet from checkpoint.
+    
+    Args:
+        model_ckpt: Path to checkpoint file
+        device: Device to load model on
+        use_mask: Whether model uses mask channel
+        bg_model_version: "v1" for original, "v2" for enhanced with mask-weighted residuals
+    
+    Returns:
+        Loaded model in eval mode
+    """
+    if bg_model_version == "v2":
+        # v2: Enhanced model with mask-weighted residuals
+        # Try to infer settings from checkpoint, or use defaults
+        model = BgResidualNetV2(
+            in_ch=3,
+            base_ch=48,  # v2 default
+            use_mask=True,  # v2 always uses masks
+            bg_residual_scale=1.0,
+            subj_residual_scale=0.1
+        ).to(device)
+    else:
+        # v1: Original model
+        model = BgResidualNet(in_ch=3, base_ch=32, use_mask=use_mask).to(device)
+    
     ckpt = torch.load(model_ckpt, map_location=device)
 
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -83,6 +108,12 @@ def parse_args():
         action="store_true",
         help="Use subject mask as 4th channel input (requires --mask_glob)",
     )
+    parser.add_argument(
+        "--bg_model_version",
+        type=str,
+        default=None,
+        help="BG model version: 'v1' (original) or 'v2' (enhanced with mask-weighted residuals). If not provided, tries to infer from config or defaults to v1.",
+    )
     return parser.parse_args()
 
 
@@ -108,8 +139,21 @@ def main():
     if args.residual_scale is None:
         args.residual_scale = 0.3  # Default
     
+    # Determine model version
+    bg_model_version = args.bg_model_version
+    if bg_model_version is None:
+        # Try to infer from config
+        if cfg:
+            bg_cfg = cfg.get("training", {}).get("bg_residual", {})
+            bg_model_version = bg_cfg.get("bg_model_version", "v1")
+        else:
+            bg_model_version = "v1"
+    
     # Check if masks should be used
     use_mask = args.use_mask and args.mask_glob is not None
+    # v2 always requires masks
+    if bg_model_version == "v2" and not use_mask:
+        print("Warning: bg_model_version=v2 requires --use_mask and --mask_glob. Attempting to continue without masks...")
 
     files = sorted([Path(p) for p in glob.glob(args.input_glob)])
     files = [p for p in files if p.suffix.lower() in IMG_OK]
@@ -135,6 +179,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Loading model from: {args.model_ckpt}")
+    print(f"BG Model Version: {bg_model_version}")
     print(f"Residual scale: {args.residual_scale}")
     print(f"Use mask: {use_mask}")
     if use_mask:
@@ -142,7 +187,7 @@ def main():
         print(f"Found {len(mask_paths)} masks")
     print(f"Processing {len(files)} images...")
 
-    model = load_model(args.model_ckpt, device, use_mask=use_mask)
+    model = load_model(args.model_ckpt, device, use_mask=use_mask, bg_model_version=bg_model_version)
     to_tensor = T.ToTensor()
     to_pil = T.ToPILImage()
 
@@ -164,13 +209,20 @@ def main():
 
             with torch.no_grad():
                 # Forward pass
-                if use_mask and mask is not None:
+                if bg_model_version == "v2" and use_mask and mask is not None:
+                    # v2: Use mask-weighted residual application
+                    residual = model.forward_with_mask_weighted(xb, mask)
+                    residual = torch.tanh(residual) * 0.6  # v2: stronger residuals (0.6 vs v1's 0.3)
+                elif use_mask and mask is not None:
+                    # v1: Standard mask channel input
                     residual = model.forward_with_mask(xb, mask)
+                    residual = torch.tanh(residual) * 0.3  # v1 scaling
                 else:
+                    # No mask: standard forward pass
                     residual = model(xb)
+                    residual = torch.tanh(residual) * 0.3
                 
-                # Scale residual (matching training scaling)
-                residual = torch.tanh(residual) * 0.3  # Match training scaling
+                # Apply global residual scale (user control)
                 residual_scaled = args.residual_scale * residual
                 pred = torch.clamp(xb + residual_scaled, 0.0, 1.0)
 

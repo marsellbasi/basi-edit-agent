@@ -11,6 +11,8 @@ from torchvision import transforms as T
 from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
+from models.residual_unet import BgResidualNet, BgResidualNetV2
+
 # ...
 
 # -----------------------------
@@ -338,6 +340,10 @@ def train(args):
         print("Mask support: Enabled (masks required for loss computation)")
     else:
         print("Mask support: Disabled (using fallback loss computation)")
+    
+    # Determine model version (from args, set in parse_args)
+    bg_model_version = args.bg_model_version
+    print(f"BG Model Version: {bg_model_version}")
 
     # Create model
 
@@ -422,7 +428,30 @@ def train(args):
     # -------------------------------------------------
     # Model
     # -------------------------------------------------
-    model = BgResidualNet(in_ch=3, base_ch=32, use_mask=args.use_mask and has_masks).to(device)
+    # Select model version: v1 (original) or v2 (stronger background edits with mask-weighted residuals)
+    if bg_model_version == "v2":
+        # v2: Enhanced model with mask-weighted residual application
+        base_ch = getattr(args, 'base_ch', 48)
+        bg_residual_scale = getattr(args, 'bg_residual_scale', 1.0)
+        subj_residual_scale = getattr(args, 'subj_residual_scale', 0.1)
+        
+        if not args.use_mask:
+            print("Warning: bg_model_version=v2 requires use_mask=True. Enabling mask support.")
+            args.use_mask = True
+        
+        model = BgResidualNetV2(
+            in_ch=3,
+            base_ch=base_ch,
+            use_mask=True,  # v2 always uses masks
+            bg_residual_scale=bg_residual_scale,
+            subj_residual_scale=subj_residual_scale
+        ).to(device)
+        print(f"[train_bg_model_residual] Using BgResidualNetV2: base_ch={base_ch}, "
+              f"bg_scale={bg_residual_scale}, subj_scale={subj_residual_scale}")
+    else:
+        # v1: Original model
+        model = BgResidualNet(in_ch=3, base_ch=32, use_mask=args.use_mask and has_masks).to(device)
+        print(f"[train_bg_model_residual] Using BgResidualNet v1")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -467,6 +496,7 @@ def train(args):
     identity_weight = args.identity_weight
     print(f"[train_bg_model_residual] identity_weight={identity_weight}")
     print(f"[train_bg_model_residual] use_mask={args.use_mask}")
+    print(f"[train_bg_model_residual] bg_model_version={bg_model_version}")
 
     def compute_loss_with_mask(pred, target_bg, target_identity, mask, identity_weight):
         """
@@ -525,13 +555,24 @@ def train(args):
             optimizer.zero_grad()
 
             # Forward pass: use mask if model supports it
-            if model.use_mask and mb is not None:
+            if bg_model_version == "v2" and mb is not None:
+                # v2: Use mask-weighted residual application
+                mb = mb.to(device)
+                residual = model.forward_with_mask_weighted(xb, mb)
+                # v2: No tanh scaling - let the model learn larger residuals, mask weighting handles suppression
+                # Apply a gentle tanh to prevent extreme values, but allow larger range
+                residual = torch.tanh(residual) * 0.6  # v2: 0.6 vs v1's 0.3 for stronger residuals
+            elif model.use_mask and mb is not None:
+                # v1: Standard mask channel input
                 mb = mb.to(device)
                 residual = model.forward_with_mask(xb, mb)
+                # v1: Scale residual to be reasonably small
+                residual = torch.tanh(residual) * 0.3
             else:
+                # No mask: standard forward pass
                 residual = model(xb)
-            # scale residual to be reasonably small at the start
-            residual = torch.tanh(residual) * 0.3
+                residual = torch.tanh(residual) * 0.3
+            
             pred = torch.clamp(xb + residual, 0.0, 1.0)
 
             # Compute loss
@@ -581,12 +622,21 @@ def train(args):
                 yb = yb.to(device)
 
                 # Forward pass: use mask if model supports it
-                if model.use_mask and mb is not None:
+                if bg_model_version == "v2" and mb is not None:
+                    # v2: Use mask-weighted residual application
+                    mb = mb.to(device)
+                    residual = model.forward_with_mask_weighted(xb, mb)
+                    residual = torch.tanh(residual) * 0.6  # v2: stronger residuals
+                elif model.use_mask and mb is not None:
+                    # v1: Standard mask channel input
                     mb = mb.to(device)
                     residual = model.forward_with_mask(xb, mb)
+                    residual = torch.tanh(residual) * 0.3
                 else:
+                    # No mask: standard forward pass
                     residual = model(xb)
-                residual = torch.tanh(residual) * 0.3
+                    residual = torch.tanh(residual) * 0.3
+                
                 pred = torch.clamp(xb + residual, 0.0, 1.0)
 
                 # Compute validation loss (background L1 only)
@@ -741,6 +791,13 @@ def parse_args():
     # use_mask: If CLI flag was set (--use_mask in sys.argv), it's True. Otherwise use config value.
     if "--use_mask" not in sys.argv:
         args.use_mask = bg_cfg.get("use_mask", False)
+    
+    # bg_model_version: v1 (original) or v2 (stronger background edits with mask-weighted residuals)
+    args.bg_model_version = bg_cfg.get("bg_model_version", "v1")
+    # v2-specific settings
+    args.base_ch = bg_cfg.get("base_ch", 48)
+    args.bg_residual_scale = bg_cfg.get("bg_residual_scale", 1.0)
+    args.subj_residual_scale = bg_cfg.get("subj_residual_scale", 0.1)
     
     # Build globs from dataset_version if not provided
     if args.train_before_glob is None:
