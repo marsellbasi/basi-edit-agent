@@ -428,7 +428,11 @@ def train(args):
     print(f"Checkpoints will be saved to: {args.model_dir}")
     print("=" * 60)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Cast config values to correct types (YAML may read them as strings)
+    lr = float(args.lr)
+    weight_decay = float(args.weight_decay)
+    print(f"[train_bg_model_residual] Using lr={lr} weight_decay={weight_decay}")
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     best_val = float("inf")
     start_epoch = 1
@@ -626,6 +630,8 @@ def parse_args():
                    help="Max side length (overrides config)")
     p.add_argument("--lr", type=float, default=None,
                    help="Learning rate (overrides config)")
+    p.add_argument("--weight_decay", type=float, default=None,
+                   help="Weight decay (overrides config)")
     p.add_argument("--model_dir", type=str, default=None,
                    help="Model directory (overrides config)")
     p.add_argument("--identity_weight", type=float, default=None,
@@ -671,6 +677,8 @@ def parse_args():
         args.max_side = bg_cfg.get("max_side", 1024)
     if args.lr is None:
         args.lr = bg_cfg.get("lr", 1e-4)
+    if args.weight_decay is None:
+        args.weight_decay = bg_cfg.get("weight_decay", 0.0)
     if args.model_dir is None:
         args.model_dir = bg_cfg.get("model_dir", "checkpoints/bg_residual")
     if args.identity_weight is None:
