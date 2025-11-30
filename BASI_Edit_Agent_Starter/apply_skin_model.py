@@ -93,9 +93,14 @@ def main():
         else:
             args.model_ckpt = "checkpoints/skin_residual/best.pt"
     
-    # Determine residual scale
+    # Determine residual scale (from config or default)
     if args.residual_scale is None:
-        args.residual_scale = 0.5  # Default for skin model
+        if cfg:
+            # Try to get from config, but skin_residual doesn't have residual_scale in training config
+            # Use default 0.5 for skin model (gentle retouching)
+            args.residual_scale = 0.5
+        else:
+            args.residual_scale = 0.5  # Default for skin model
     
     # Determine device
     if args.device is None:

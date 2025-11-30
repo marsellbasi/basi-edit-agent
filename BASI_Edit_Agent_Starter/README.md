@@ -475,18 +475,42 @@ BASI_EDIT_AGENT/skin_v1/
     after/*.jpg
 ```
 
+**Important:** Images are paired by sorted filename order. The i-th "before" image (alphabetically sorted) is paired with the i-th "after" image. Ensure filenames match between before/after directories.
+
+Example:
+- `before/IMG_001.jpg` pairs with `after/IMG_001.jpg`
+- `before/IMG_002.jpg` pairs with `after/IMG_002.jpg`
+
 The dataset paths are configured in `config.yaml` under the `datasets.skin_v1` section.
 
 ### Training Stage 3 skin model
 
+**On RunPod (from `/workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter`):**
+
 ```bash
-cd BASI_Edit_Agent_Starter
-python train_skin_model.py \
+python3 train_skin_model.py \
   --config config.yaml \
   --dataset_version skin_v1 \
   --epochs 20 \
   --batch_size 4 \
   --max_side 1024
+```
+
+**Or use config defaults (all values from config.yaml):**
+
+```bash
+python3 train_skin_model.py \
+  --config config.yaml \
+  --dataset_version skin_v1
+```
+
+**Resume from checkpoint:**
+
+```bash
+python3 train_skin_model.py \
+  --config config.yaml \
+  --dataset_version skin_v1 \
+  --resume
 ```
 
 **Command-line options:**
@@ -513,11 +537,23 @@ python train_skin_model.py \
 
 ### Applying Stage 3 to images
 
+**On RunPod (from `/workspace/code/basi-edit-agent/BASI_Edit_Agent_Starter`):**
+
 ```bash
-python apply_skin_model.py \
+python3 apply_skin_model.py \
   --input_glob "BASI_EDIT_AGENT/skin_v1/val/before/*.jpg" \
-  --output_dir "outputs/skin_retouched" \
+  --output_dir "outputs/skin_v1_val_latest" \
   --model_ckpt "checkpoints/skin_residual/best.pt" \
+  --residual_scale 0.5
+```
+
+**Using config defaults (model path from config.yaml):**
+
+```bash
+python3 apply_skin_model.py \
+  --input_glob "BASI_EDIT_AGENT/skin_v1/val/before/*.jpg" \
+  --output_dir "outputs/skin_v1_val_latest" \
+  --config config.yaml \
   --residual_scale 0.5
 ```
 
@@ -531,8 +567,15 @@ python apply_skin_model.py \
 
 The `residual_scale` parameter controls the strength of the retouching effect:
 - `0.0`: No effect (original image)
-- `0.5`: Moderate retouching (default)
-- `1.0`: Full model effect
+- `0.3`: Subtle retouching (gentle skin smoothing)
+- `0.5`: Moderate retouching (default, recommended for most use cases)
+- `0.7`: Strong retouching (more noticeable smoothing)
+- `1.0`: Full model effect (maximum smoothing, may look over-processed)
+
+**Recommended ranges:**
+- Portrait photography: `0.3-0.5` for natural-looking results
+- Beauty/editorial: `0.5-0.7` for more pronounced smoothing
+- Conservative edits: `0.2-0.3` for minimal changes
 
 ### Pipeline Integration
 

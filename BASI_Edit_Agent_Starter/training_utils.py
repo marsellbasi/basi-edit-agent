@@ -16,6 +16,16 @@ class BeforeAfterDataset(Dataset):
     """
     Generic dataset for paired before/after images.
     
+    Images are paired by sorted filename order. Both before_glob and after_glob
+    are sorted alphabetically, and the i-th before image is paired with the i-th
+    after image. This requires that filenames match between before/after directories.
+    
+    Example dataset structure:
+        BASI_EDIT_AGENT/skin_v1/train/before/IMG_001.jpg
+        BASI_EDIT_AGENT/skin_v1/train/before/IMG_002.jpg
+        BASI_EDIT_AGENT/skin_v1/train/after/IMG_001.jpg
+        BASI_EDIT_AGENT/skin_v1/train/after/IMG_002.jpg
+    
     Args:
         before_glob: Glob pattern for "before" images
         after_glob: Glob pattern for "after" images
@@ -27,7 +37,8 @@ class BeforeAfterDataset(Dataset):
         self.after_paths = sorted(glob.glob(after_glob))
         
         assert len(self.before_paths) == len(self.after_paths), \
-            f"len(before)={len(self.before_paths)} len(after)={len(self.after_paths)} mismatch"
+            f"len(before)={len(self.before_paths)} len(after)={len(self.after_paths)} mismatch. " \
+            f"Ensure filenames match between before and after directories."
         
         self.max_side = max_side
         self.is_train = is_train
