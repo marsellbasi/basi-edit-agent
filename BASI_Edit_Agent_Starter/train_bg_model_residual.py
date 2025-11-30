@@ -336,13 +336,30 @@ def train(args):
     )
 
     print(f"Train pairs: {len(train_ds)} | Val pairs: {len(val_ds)}")
-    if args.use_mask:
-        print("Mask support: Enabled (masks required for loss computation)")
+    
+    # Check if masks actually exist in the dataset
+    has_masks = False
+    if args.use_mask and len(train_ds) > 0:
+        # Sample a few items to check if masks exist
+        for i in range(min(5, len(train_ds))):
+            try:
+                _, _, m = train_ds[i]
+                if m is not None:
+                    has_masks = True
+                    break
+            except Exception:
+                # If loading fails, continue checking
+                continue
+    
+    # Determine effective mask usage
+    use_mask_effective = args.use_mask and has_masks
+    if args.use_mask and not has_masks:
+        print("WARNING: --use_mask was set but dataset has no masks; continuing with use_mask=False.")
+    
+    if use_mask_effective:
+        print("Mask support: Enabled (masks found and will be used for loss computation)")
     else:
         print("Mask support: Disabled (using fallback loss computation)")
-    
-    # Determine whether we should use masks in the model
-    has_masks = bool(args.use_mask)
     
     # Determine model version (from args, set in parse_args)
     bg_model_version = args.bg_model_version
@@ -438,23 +455,22 @@ def train(args):
         bg_residual_scale = getattr(args, 'bg_residual_scale', 1.0)
         subj_residual_scale = getattr(args, 'subj_residual_scale', 0.1)
         
-        if not args.use_mask:
-            print("Warning: bg_model_version=v2 requires use_mask=True. Enabling mask support.")
-            args.use_mask = True
+        if not use_mask_effective:
+            print("Warning: bg_model_version=v2 works best with masks. Continuing without mask-weighted residuals.")
         
         model = BgResidualNetV2(
             in_ch=3,
             base_ch=base_ch,
-            use_mask=True,  # v2 always uses masks
+            use_mask=use_mask_effective,  # Use effective mask flag
             bg_residual_scale=bg_residual_scale,
             subj_residual_scale=subj_residual_scale
         ).to(device)
         print(f"[train_bg_model_residual] Using BgResidualNetV2: base_ch={base_ch}, "
-              f"bg_scale={bg_residual_scale}, subj_scale={subj_residual_scale}")
+              f"bg_scale={bg_residual_scale}, subj_scale={subj_residual_scale}, use_mask={use_mask_effective}")
     else:
         # v1: Original model
-        model = BgResidualNet(in_ch=3, base_ch=32, use_mask=args.use_mask and has_masks).to(device)
-        print(f"[train_bg_model_residual] Using BgResidualNet v1")
+        model = BgResidualNet(in_ch=3, base_ch=32, use_mask=use_mask_effective).to(device)
+        print(f"[train_bg_model_residual] Using BgResidualNet v1, use_mask={use_mask_effective}")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -558,13 +574,16 @@ def train(args):
             optimizer.zero_grad()
 
             # Forward pass: use mask if model supports it
-            if bg_model_version == "v2" and mb is not None:
+            if bg_model_version == "v2" and use_mask_effective and mb is not None:
                 # v2: Use mask-weighted residual application
                 mb = mb.to(device)
                 residual = model.forward_with_mask_weighted(xb, mb)
-                # v2: No tanh scaling - let the model learn larger residuals, mask weighting handles suppression
-                # Apply a gentle tanh to prevent extreme values, but allow larger range
-                residual = torch.tanh(residual) * 0.6  # v2: 0.6 vs v1's 0.3 for stronger residuals
+                # v2: Apply tanh scaling - allow larger residuals (0.6 vs v1's 0.3)
+                residual = torch.tanh(residual) * 0.6
+            elif bg_model_version == "v2" and not use_mask_effective:
+                # v2 without masks: fallback to standard forward
+                residual = model(xb)
+                residual = torch.tanh(residual) * 0.6  # Still use v2's stronger scaling
             elif model.use_mask and mb is not None:
                 # v1: Standard mask channel input
                 mb = mb.to(device)
@@ -579,7 +598,7 @@ def train(args):
             pred = torch.clamp(xb + residual, 0.0, 1.0)
 
             # Compute loss
-            if args.use_mask and mb is not None:
+            if use_mask_effective and mb is not None:
                 # Use mask-based loss computation
                 mb = mb.to(device)
                 loss, loss_bg, loss_identity = compute_loss_with_mask(
@@ -625,11 +644,15 @@ def train(args):
                 yb = yb.to(device)
 
                 # Forward pass: use mask if model supports it
-                if bg_model_version == "v2" and mb is not None:
+                if bg_model_version == "v2" and use_mask_effective and mb is not None:
                     # v2: Use mask-weighted residual application
                     mb = mb.to(device)
                     residual = model.forward_with_mask_weighted(xb, mb)
                     residual = torch.tanh(residual) * 0.6  # v2: stronger residuals
+                elif bg_model_version == "v2" and not use_mask_effective:
+                    # v2 without masks: fallback to standard forward
+                    residual = model(xb)
+                    residual = torch.tanh(residual) * 0.6
                 elif model.use_mask and mb is not None:
                     # v1: Standard mask channel input
                     mb = mb.to(device)
@@ -643,7 +666,7 @@ def train(args):
                 pred = torch.clamp(xb + residual, 0.0, 1.0)
 
                 # Compute validation loss (background L1 only)
-                if args.use_mask and mb is not None:
+                if use_mask_effective and mb is not None:
                     mb = mb.to(device)
                     # For validation, we only compute background L1
                     if mb.dim() == 3:
