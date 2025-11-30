@@ -1,107 +1,235 @@
+#!/usr/bin/env python3
+
+"""
+Make side-by-side triplet previews:
+
+    [ BEFORE | MODEL OUTPUT | AFTER ]
+
+
+General-purpose triplet preview generator for BASI Edit Agent.
+Given three folders of images (before / model_output / after),
+generates triplet previews laid out horizontally for easy side-by-side review.
+
+
+Example usage:
+
+python make_triplets.py \
+  --before_glob "BASI_EDIT_AGENT/dataset_v1/val/before/*.jpg" \
+  --model_glob  "BASI_Edit_Agent_Starter/test_outputs_unet_scaled/*.jpg" \
+  --after_glob  "BASI_EDIT_AGENT/dataset_v1/val/after/*.jpg" \
+  --output_dir  "triplets_unet_v1" \
+  --max_triplets 50 \
+  --resize_long_edge 1600
+"""
+
 import argparse
 import glob
 import os
-from typing import List, Tuple
+import random
+from pathlib import Path
+from typing import Dict, List
 
-import torch
 from PIL import Image
-from torchvision import transforms as T
-
-from BASI_Edit_Agent_Starter.train_bg_model_residual import BgResidualNet
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Create before/model/after triplets.")
-    parser.add_argument("--before_glob", type=str, required=True)
-    parser.add_argument("--after_glob", type=str, required=True)
-    parser.add_argument("--model_ckpt", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, required=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create before/model/after triplet previews."
+    )
+    parser.add_argument(
+        "--before_glob",
+        type=str,
+        required=True,
+        help="Glob pattern for original 'before' images.",
+    )
+    parser.add_argument(
+        "--model_glob",
+        type=str,
+        required=True,
+        help="Glob pattern for model output images.",
+    )
+    parser.add_argument(
+        "--after_glob",
+        type=str,
+        required=True,
+        help="Glob pattern for hand-edited 'after' images.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory to save triplet JPEGs.",
+    )
+    parser.add_argument(
+        "--max_triplets",
+        type=int,
+        default=0,
+        help="Maximum number of triplets to generate (0 = no limit).",
+    )
+    parser.add_argument(
+        "--resize_long_edge",
+        type=int,
+        default=1600,
+        help="Resize each image so its long edge equals this size (preserves aspect ratio).",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Randomly shuffle matched stems before picking triplets.",
+    )
     return parser.parse_args()
 
 
-def resize_to_height(img: Image.Image, target_h: int) -> Image.Image:
-    if img.height == target_h:
+def get_stem(path: str) -> str:
+    """Extract stem (filename without extension) from a path."""
+    return Path(path).stem
+
+
+def index_by_stem(paths: List[str]) -> Dict[str, str]:
+    """Build a dictionary mapping stem (filename without extension) to full path."""
+    out: Dict[str, str] = {}
+    for p in paths:
+        stem = get_stem(p)
+        if stem in out:
+            # Warn if duplicate stems found
+            print(f"Warning: duplicate stem '{stem}' found. Using: {p}")
+        out[stem] = p
+    return out
+
+
+def load_and_resize(path: str, max_long_edge: int) -> Image.Image:
+    """Load image and resize so long edge equals max_long_edge, preserving aspect ratio."""
+    img = Image.open(path).convert("RGB")
+    w, h = img.size
+    long_edge = max(w, h)
+    
+    if long_edge <= max_long_edge:
         return img
-    w = int(img.width * target_h / img.height)
-    return img.resize((w, target_h), Image.LANCZOS)
+    
+    scale = max_long_edge / float(long_edge)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    return img.resize((new_w, new_h), resample=Image.BICUBIC)
 
 
-def load_pairs(before_glob: str, after_glob: str) -> List[Tuple[str, str]]:
-    before_paths = sorted(glob.glob(before_glob))
-    after_paths = sorted(glob.glob(after_glob))
-    n = min(len(before_paths), len(after_paths))
-    return list(zip(before_paths[:n], after_paths[:n])), n
+def make_triplet(
+    before_path: str,
+    model_path: str,
+    after_path: str,
+    out_path: str,
+    max_long_edge: int,
+) -> None:
+    """Create a horizontal triplet image from before, model, and after images."""
+    # Load and resize each image
+    before = load_and_resize(before_path, max_long_edge)
+    model = load_and_resize(model_path, max_long_edge)
+    after = load_and_resize(after_path, max_long_edge)
+    
+    # Compute target height (max of all three)
+    target_h = max(before.height, model.height, after.height)
+    
+    # Create a canvas with target height
+    total_w = before.width + model.width + after.width
+    canvas = Image.new("RGB", (total_w, target_h), (0, 0, 0))
+    
+    # Paste images horizontally, centering vertically if needed
+    x = 0
+    for img in (before, model, after):
+        # Center vertically if image is shorter than target_h
+        y_offset = (target_h - img.height) // 2
+        canvas.paste(img, (x, y_offset))
+        x += img.width
+    
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path, "JPEG", quality=95)
 
 
-def load_model(model_ckpt: str, device: torch.device) -> torch.nn.Module:
-    model = BgResidualNet(in_ch=3, base_ch=32).to(device)
-    checkpoint = torch.load(model_ckpt, map_location=device)
-
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model.eval()
-    return model
-
-
-def main():
+def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    pairs, n = load_pairs(args.before_glob, args.after_glob)
-    if n == 0:
-        print(
-            f"No pairs found for before_glob={args.before_glob}, after_glob={args.after_glob}"
+    
+    # Load all images matching each glob
+    before_paths = sorted(glob.glob(args.before_glob))
+    model_paths = sorted(glob.glob(args.model_glob))
+    after_paths = sorted(glob.glob(args.after_glob))
+    
+    # Check for empty globs
+    if not before_paths:
+        raise RuntimeError(f"No BEFORE images found for glob: {args.before_glob}")
+    if not model_paths:
+        raise RuntimeError(f"No MODEL images found for glob: {args.model_glob}")
+    if not after_paths:
+        raise RuntimeError(f"No AFTER images found for glob: {args.after_glob}")
+    
+    # Build dictionaries keyed by stem
+    before_map = index_by_stem(before_paths)
+    model_map = index_by_stem(model_paths)
+    after_map = index_by_stem(after_paths)
+    
+    # Compute intersection of stems present in all three sets
+    common_stems = set(before_map.keys()) & set(model_map.keys()) & set(after_map.keys())
+    
+    if not common_stems:
+        raise RuntimeError(
+            "No matching stems found across before/model/after sets. "
+            "Make sure filenames (without extensions) match across all three directories."
         )
-        return
-
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    model = load_model(args.model_ckpt, device)
-    to_tensor = T.ToTensor()
-    to_pil = T.ToPILImage()
-
-    saved = 0
-    for before_path, after_path in pairs:
+    
+    # Convert to sorted list for reproducibility
+    common_stems = sorted(common_stems)
+    
+    # Shuffle if requested
+    if args.shuffle:
+        random.shuffle(common_stems)
+    
+    # Limit to max_triplets if specified
+    if args.max_triplets > 0:
+        common_stems = common_stems[:args.max_triplets]
+    
+    # Print summary stats
+    print(f"Found {len(before_paths)} BEFORE, {len(model_paths)} MODEL, {len(after_paths)} AFTER")
+    print(f"Common stems: {len(common_stems)}")
+    print(f"Writing {len(common_stems)} triplets to {args.output_dir}")
+    
+    # Create output directory
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate triplets
+    for i, stem in enumerate(common_stems, start=1):
+        before_path = before_map[stem]
+        model_path = model_map[stem]
+        after_path = after_map[stem]
+        
+        out_name = f"{stem}_triplet.jpg"
+        out_path = out_dir / out_name
+        
         try:
-            before_img = Image.open(before_path).convert("RGB")
-            after_img = Image.open(after_path).convert("RGB")
+            make_triplet(
+                before_path=before_path,
+                model_path=model_path,
+                after_path=after_path,
+                out_path=str(out_path),
+                max_long_edge=args.resize_long_edge,
+            )
+            print(f"[{i}/{len(common_stems)}] Saved triplet: {out_path}")
         except Exception as exc:
-            print(f"Skipping pair ({before_path}, {after_path}) due to error: {exc}")
+            print(f"[{i}/{len(common_stems)}] Error processing {stem}: {exc}")
             continue
-
-        xb = to_tensor(before_img).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            residual = model(xb)
-            model_img_tensor = torch.clamp(xb + residual, 0.0, 1.0)
-
-        model_img = to_pil(model_img_tensor.squeeze(0).cpu())
-
-        target_h = max(before_img.height, model_img.height, after_img.height)
-        before_resized = resize_to_height(before_img, target_h)
-        model_resized = resize_to_height(model_img, target_h)
-        after_resized = resize_to_height(after_img, target_h)
-
-        total_w = (
-            before_resized.width + model_resized.width + after_resized.width
-        )
-        triplet = Image.new("RGB", (total_w, target_h), (0, 0, 0))
-
-        x = 0
-        for img in (before_resized, model_resized, after_resized):
-            triplet.paste(img, (x, 0))
-            x += img.width
-
-        base = os.path.splitext(os.path.basename(before_path))[0]
-        out_path = os.path.join(args.out_dir, f"{base}_triplet.jpg")
-        triplet.save(out_path, quality=95)
-        saved += 1
-
-    print(f"Saved {saved} triplet previews to {args.out_dir}")
+    
+    print(f"\nDone. Triplets saved to: {out_dir}")
 
 
 if __name__ == "__main__":
     main()
+
+
+# Example: Generate triplets for UNet color model on dataset_v1
+#
+# python make_triplets.py \
+#   --before_glob "BASI_EDIT_AGENT/dataset_v1/val/before/*.jpg" \
+#   --model_glob  "BASI_Edit_Agent_Starter/test_outputs_unet_scaled/*.jpg" \
+#   --after_glob  "BASI_EDIT_AGENT/dataset_v1/val/after/*.jpg" \
+#   --output_dir  "triplets_unet_v1" \
+#   --max_triplets 50 \
+#   --resize_long_edge 1600
