@@ -341,6 +341,9 @@ def train(args):
     else:
         print("Mask support: Disabled (using fallback loss computation)")
     
+    # Determine whether we should use masks in the model
+    has_masks = bool(args.use_mask)
+    
     # Determine model version (from args, set in parse_args)
     bg_model_version = args.bg_model_version
     print(f"BG Model Version: {bg_model_version}")
