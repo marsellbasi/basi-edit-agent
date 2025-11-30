@@ -1,4 +1,4 @@
-import argparse, os, glob, subprocess
+import argparse, os, glob, subprocess, sys
 import yaml
 from PIL import Image
 
@@ -18,7 +18,7 @@ from tqdm import tqdm
 # -----------------------------
 
 class BgDataset(Dataset):
-    def __init__(self, before_glob, after_glob, max_side=640, is_train=True):
+    def __init__(self, before_glob, after_glob, max_side=640, is_train=True, use_mask=False):
         self.before_paths = sorted(glob.glob(before_glob))
         self.after_paths = sorted(glob.glob(after_glob))
 
@@ -27,6 +27,7 @@ class BgDataset(Dataset):
 
         self.max_side = max_side
         self.is_train = is_train
+        self.use_mask = use_mask
 
     def __len__(self):
         return len(self.before_paths)
@@ -68,6 +69,13 @@ class BgDataset(Dataset):
         y_img = Image.open(after_path).convert("RGB")
         m_img = self._load_mask(before_path)
 
+        # If use_mask is True, require mask to exist
+        if self.use_mask and m_img is None:
+            raise RuntimeError(
+                f"use_mask=True but mask not found for: {before_path}\n"
+                f"Expected mask at: {before_path.replace('/before/', '/masks/').replace('.jpg', '.png')}"
+            )
+
         # Basic resize to max_side for all
         x_img = self._resize(x_img, self.max_side)
         y_img = self._resize(y_img, self.max_side)
@@ -83,8 +91,11 @@ class BgDataset(Dataset):
 
         if m_img is not None:
             import numpy as np
-            m_np = (np.array(m_img) > 0).astype("float32")  # [H,W], 0 or 1
-            m = torch.from_numpy(m_np)  # [H,W]
+            # Normalize mask to [0, 1] range (values may be 0-255)
+            m_np = np.array(m_img).astype("float32")
+            if m_np.max() > 1.0:
+                m_np = m_np / 255.0
+            m = torch.from_numpy(m_np)  # [H,W], values in [0, 1]
         else:
             m = None
 
@@ -312,29 +323,21 @@ def train(args):
         after_glob=args.train_after_glob,
         max_side=args.max_side,
         is_train=True,
+        use_mask=args.use_mask,
     )
     val_ds = BgDataset(
         before_glob=args.val_before_glob,
         after_glob=args.val_after_glob,
         max_side=args.max_side,
         is_train=False,
+        use_mask=args.use_mask,
     )
 
-    # Check if masks are available
-    has_masks = False
-    if args.use_mask:
-        # Check first few samples for mask availability
-        for i in range(min(5, len(train_ds))):
-            _, _, m = train_ds[i]
-            if m is not None:
-                has_masks = True
-                break
-    
     print(f"Train pairs: {len(train_ds)} | Val pairs: {len(val_ds)}")
     if args.use_mask:
-        print(f"Mask support: {'Enabled (masks found)' if has_masks else 'Enabled (no masks found, will use fallback)'}")
+        print("Mask support: Enabled (masks required for loss computation)")
     else:
-        print("Mask support: Disabled")
+        print("Mask support: Disabled (using fallback loss computation)")
 
     # Create model
 
@@ -463,16 +466,50 @@ def train(args):
 
     identity_weight = args.identity_weight
     print(f"[train_bg_model_residual] identity_weight={identity_weight}")
+    print(f"[train_bg_model_residual] use_mask={args.use_mask}")
 
-    def masked_l1(pred, target, mask):
+    def compute_loss_with_mask(pred, target_bg, target_identity, mask, identity_weight):
         """
-        pred, target: [B,3,H,W]
-        mask: [B,1,H,W] with 0/1
+        Compute loss using subject masks.
+        
+        pred: [B,3,H,W] - model prediction
+        target_bg: [B,3,H,W] - target for background (after image)
+        target_identity: [B,3,H,W] - target for identity (before image)
+        mask: [B,H,W] or [B,1,H,W] - subject mask (1 = subject, 0 = background)
+        identity_weight: float - weight for identity loss
+        
+        Returns:
+            loss: scalar tensor
+            loss_bg: scalar tensor (background L1)
+            loss_identity: scalar tensor (identity L1)
         """
-        diff = torch.abs(pred - target) * mask
-        # avoid division by zero
-        denom = mask.sum() * pred.shape[1] + 1e-8
-        return diff.sum() / denom
+        # Ensure mask is [B,1,H,W]
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)  # [B,H,W] -> [B,1,H,W]
+        
+        # Broadcast mask to 3 channels: [B,1,H,W] -> [B,3,H,W]
+        mask_3ch = mask.expand_as(pred)
+        
+        # Background mask: 1 on background, 0 on subject
+        bg_mask = 1.0 - mask_3ch  # [B,3,H,W]
+        
+        # Subject mask: 1 on subject, 0 on background
+        subj_mask = mask_3ch  # [B,3,H,W]
+        
+        # Background loss: L1 only on background pixels
+        bg_diff = bg_mask * torch.abs(pred - target_bg)
+        bg_mask_sum = bg_mask.sum() + 1e-8  # avoid division by zero
+        loss_bg = bg_diff.sum() / bg_mask_sum
+        
+        # Identity loss: L1 only on subject pixels
+        id_diff = subj_mask * torch.abs(pred - target_identity)
+        subj_mask_sum = subj_mask.sum() + 1e-8  # avoid division by zero
+        loss_identity = id_diff.sum() / subj_mask_sum
+        
+        # Total loss
+        loss = loss_bg + identity_weight * loss_identity
+        
+        return loss, loss_bg, loss_identity
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -485,19 +522,11 @@ def train(args):
             xb = xb.to(device)
             yb = yb.to(device)
 
-            if mb is not None:
-                mb = mb.to(device).unsqueeze(1)  # [B,1,H,W]
-                subject_mask = mb
-                bg_mask = 1.0 - mb
-            else:
-                # Fallback: no masks → treat whole image as both subject & bg
-                subject_mask = torch.ones_like(xb[:, :1, :, :])
-                bg_mask = torch.ones_like(xb[:, :1, :, :])
-
             optimizer.zero_grad()
 
             # Forward pass: use mask if model supports it
             if model.use_mask and mb is not None:
+                mb = mb.to(device)
                 residual = model.forward_with_mask(xb, mb)
             else:
                 residual = model(xb)
@@ -505,13 +534,28 @@ def train(args):
             residual = torch.tanh(residual) * 0.3
             pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-            # Background should match the edited AFTER image
-            loss_bg = masked_l1(pred, yb, bg_mask)
-
-            # Subject should stay close to the original BEFORE image
-            loss_identity = masked_l1(pred, xb, subject_mask)
-
-            loss = loss_bg + identity_weight * loss_identity
+            # Compute loss
+            if args.use_mask and mb is not None:
+                # Use mask-based loss computation
+                mb = mb.to(device)
+                loss, loss_bg, loss_identity = compute_loss_with_mask(
+                    pred, yb, xb, mb, identity_weight
+                )
+            else:
+                # Fallback: old behavior when use_mask is False
+                # Treat whole image as both subject & bg
+                bg_mask = torch.ones_like(xb[:, :1, :, :])
+                subject_mask = torch.ones_like(xb[:, :1, :, :])
+                
+                # Background should match the edited AFTER image
+                bg_diff = bg_mask * torch.abs(pred - yb)
+                loss_bg = bg_diff.sum() / (bg_mask.sum() * pred.shape[1] + 1e-8)
+                
+                # Subject should stay close to the original BEFORE image
+                id_diff = subject_mask * torch.abs(pred - xb)
+                loss_identity = id_diff.sum() / (subject_mask.sum() * pred.shape[1] + 1e-8)
+                
+                loss = loss_bg + identity_weight * loss_identity
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -536,21 +580,31 @@ def train(args):
                 xb = xb.to(device)
                 yb = yb.to(device)
 
-                if mb is not None:
-                    mb = mb.to(device).unsqueeze(1)  # [B,1,H,W]
-                    bg_mask = 1.0 - mb
-                else:
-                    bg_mask = torch.ones_like(xb[:, :1, :, :])
-
                 # Forward pass: use mask if model supports it
                 if model.use_mask and mb is not None:
+                    mb = mb.to(device)
                     residual = model.forward_with_mask(xb, mb)
                 else:
                     residual = model(xb)
                 residual = torch.tanh(residual) * 0.3
                 pred = torch.clamp(xb + residual, 0.0, 1.0)
 
-                loss = masked_l1(pred, yb, bg_mask)
+                # Compute validation loss (background L1 only)
+                if args.use_mask and mb is not None:
+                    mb = mb.to(device)
+                    # For validation, we only compute background L1
+                    if mb.dim() == 3:
+                        mb = mb.unsqueeze(1)  # [B,H,W] -> [B,1,H,W]
+                    bg_mask = (1.0 - mb).expand_as(pred)  # [B,3,H,W]
+                    bg_diff = bg_mask * torch.abs(pred - yb)
+                    bg_mask_sum = bg_mask.sum() + 1e-8
+                    loss = bg_diff.sum() / bg_mask_sum
+                else:
+                    # Fallback: old behavior
+                    bg_mask = torch.ones_like(xb[:, :1, :, :])
+                    bg_diff = bg_mask * torch.abs(pred - yb)
+                    loss = bg_diff.sum() / (bg_mask.sum() * pred.shape[1] + 1e-8)
+                
                 val_running += loss.item() * xb.size(0)
 
         val_l1 = val_running / len(val_ds)
@@ -656,7 +710,7 @@ def parse_args():
     p.add_argument("--gcs_backup_dir", type=str, default="",
                    help="GCS path to backup model_dir (e.g., gs://bucket/path). Empty to disable.")
     p.add_argument("--use_mask", action="store_true",
-                   help="Use subject mask as 4th channel input (if masks are available)")
+                   help="Use subject mask for loss computation (masks required)")
 
     args = p.parse_args()
     
@@ -684,6 +738,9 @@ def parse_args():
         args.model_dir = bg_cfg.get("model_dir", "checkpoints/bg_residual")
     if args.identity_weight is None:
         args.identity_weight = bg_cfg.get("identity_weight", 0.3)
+    # use_mask: If CLI flag was set (--use_mask in sys.argv), it's True. Otherwise use config value.
+    if "--use_mask" not in sys.argv:
+        args.use_mask = bg_cfg.get("use_mask", False)
     
     # Build globs from dataset_version if not provided
     if args.train_before_glob is None:

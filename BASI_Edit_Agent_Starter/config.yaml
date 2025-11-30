@@ -52,6 +52,7 @@ training:
     dataset_version: "bg_v1"
     max_side: 1024
     identity_weight: 0.1
+    use_mask: false
     loss:
       l1_weight: 1.0
 
