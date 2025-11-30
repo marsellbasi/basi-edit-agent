@@ -462,6 +462,7 @@ def train(args):
     print()  # Empty line before training starts
 
     identity_weight = args.identity_weight
+    print(f"[train_bg_model_residual] identity_weight={identity_weight}")
 
     def masked_l1(pred, target, mask):
         """
